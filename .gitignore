@@ -18,6 +18,9 @@
 CwsDebug_Documentation.html
 debugger_screenshot.png
 
+# Release artifacts (published via GitHub Releases, not committed)
+*.zip
+
 # OS
 Thumbs.db
 ehthumbs.db
