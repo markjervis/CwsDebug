@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>CwsDebug</RootNamespace>
+        <AssemblyName>CwsDebug</AssemblyName>
+        <AssemblyTitle>CwsDebug</AssemblyTitle>
+        <Product>CwsDebug</Product>
+        <Description>Self-contained CWS debug log page for Crestron SIMPL#Pro programs.</Description>
+        <Authors>Mark Jervis</Authors>
+        <Company>Stage Front Presentation Systems</Company>
+        <Version>1.2.0</Version>
+        <AssemblyVersion>1.2.0.0</AssemblyVersion>
+        <FileVersion>1.2.0.0</FileVersion>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Crestron.SimplSharp.SDK.ProgramLibrary" Version="2.21.257" />
+    </ItemGroup>
+
+</Project>

@@ -1,0 +1,20 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# IDE / editor
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Claude Code local settings
+.claude/
+
+# OS
+Thumbs.db
+ehthumbs.db
+.DS_Store

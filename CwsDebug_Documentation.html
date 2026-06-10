@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CwsDebug — Library Documentation</title>
+<style>
+  @page { size: Letter; margin: 22mm 20mm; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, sans-serif; color: #1f2937; font-size: 11pt; line-height: 1.5; }
+  h1 { font-size: 26pt; margin: 0 0 2pt; color: #111827; letter-spacing: .5px; }
+  h2 { font-size: 14pt; margin: 22pt 0 6pt; color: #b91c1c; border-bottom: 2px solid #e5e7eb; padding-bottom: 3pt; }
+  h3 { font-size: 11.5pt; margin: 14pt 0 4pt; color: #111827; }
+  p  { margin: 0 0 8pt; }
+  code, pre { font-family: "Consolas", "Courier New", monospace; font-size: 9.5pt; }
+  code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; color: #b91c1c; }
+  pre  { background: #0f172a; color: #e5e7eb; padding: 12px 14px; border-radius: 6px; overflow-x: auto;
+         line-height: 1.45; white-space: pre-wrap; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .subtitle { font-size: 12pt; color: #6b7280; margin: 0 0 16pt; }
+  .meta { width: 100%; border-collapse: collapse; margin: 4pt 0 8pt; }
+  .meta td { padding: 5px 8px; border: 1px solid #e5e7eb; font-size: 10.5pt; vertical-align: top; }
+  .meta td.k { background: #f9fafb; font-weight: 600; width: 130px; color: #374151; }
+  table.api { width: 100%; border-collapse: collapse; margin: 6pt 0; }
+  table.api th, table.api td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; font-size: 10pt; vertical-align: top; }
+  table.api th { background: #f3f4f6; }
+  ul { margin: 0 0 8pt; padding-left: 18px; }
+  li { margin: 2pt 0; }
+  .note { background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 10px 12px; font-size: 9.5pt; color: #92400e; margin: 10pt 0; }
+  .foot { margin-top: 20pt; border-top: 1px solid #e5e7eb; padding-top: 8pt; font-size: 8.5pt; color: #9ca3af; }
+  figure { margin: 8pt 0; }
+  figure img { width: 100%; border: 1px solid #374151; border-radius: 6px; display: block; }
+  figcaption { font-size: 9pt; color: #6b7280; margin-top: 5pt; font-style: italic; }
+  .badge { display:inline-block; background:#111827; color:#fff; font-size:8.5pt; padding:2px 8px; border-radius:10px; letter-spacing:1px; }
+</style>
+</head>
+<body>
+
+<span class="badge">CRESTRON SIMPL#PRO PROGRAM LIBRARY</span>
+<h1>CwsDebug</h1>
+<p class="subtitle">Self-contained CWS debug log page for Crestron SIMPL#Pro programs</p>
+
+<table class="meta">
+  <tr><td class="k">Author</td><td>Mark Jervis</td></tr>
+  <tr><td class="k">Company</td><td>Stage Front Presentation Systems</td></tr>
+  <tr><td class="k">Version</td><td>1.2.0</td></tr>
+  <tr><td class="k">Date</td><td>2026-06-09</td></tr>
+  <tr><td class="k">Assembly</td><td>CwsDebug.dll &nbsp;(Crestron.SimplSharp.SDK.ProgramLibrary 2.21.257, net8.0)</td></tr>
+  <tr><td class="k">Namespace</td><td>CwsDebug</td></tr>
+  <tr><td class="k">Public type</td><td>CwsDebugPage</td></tr>
+</table>
+
+<h2>Overview</h2>
+<p>CwsDebug hosts a small, self-contained web page on the Crestron Web Server (CWS) that
+streams your program's own log messages and &mdash; on a hardware appliance &mdash; the
+processor error log. The page provides live search, severity filtering, light/dark themes,
+a pause control, a master logging switch, and one-click text export. The entire UI (markup,
+CSS, and JavaScript) is embedded in the library, so there are no external content files to
+deploy.</p>
+
+<p>The log is held in a bounded in-memory ring buffer (size configurable at registration) and
+is <strong>mirrored to disk</strong>, so the most recent entries survive a program restart.
+Messages are stamped to millisecond resolution, and the page fetches only new entries on each
+poll. A process-wide <strong>singleton</strong> exposes the whole API statically, so any class
+on any thread can log without being handed an instance.</p>
+
+<div class="note"><strong>API note (since 1.1.0):</strong> the API is <em>static</em>. Call
+<code>CwsDebugPage.LogInfo(&hellip;)</code> and <code>CwsDebugPage.Register(&hellip;)</code> directly
+&mdash; do <em>not</em> construct a <code>new CwsDebugPage()</code> (the constructor is private).</div>
+
+<p>It is built as a <strong>Program Library</strong> and referenced by a SIMPL#Pro program;
+at build time the program bundles <code>CwsDebug.dll</code> into its own program archive
+(<code>.cpz</code>). The library is not separately loadable onto a processor.</p>
+
+<h2>Example</h2>
+<p>The debug page running live on an appliance. The header reads
+<code>TEST - Debugger</code> (the host program is named <em>TEST</em>); each entry shows its
+source, severity badge, message, and timestamp, with search and level filters above.</p>
+<figure>
+  <img src="debugger_screenshot.png" alt="CwsDebug page screenshot">
+  <figcaption>CwsDebug page at /cws/debugger/debugger.html (dark theme). Later builds add
+  <em>Logging</em> and <em>Pause</em> controls to the header.</figcaption>
+</figure>
+
+<h2>Installation</h2>
+<p>Add a reference to the library from your SIMPL#Pro program project:</p>
+<pre><code>&lt;ItemGroup&gt;
+  &lt;ProjectReference Include="..\CwsDebug\CwsDebug\CwsDebug.csproj" /&gt;
+&lt;/ItemGroup&gt;</code></pre>
+<p>(Or reference the compiled <code>CwsDebug.dll</code> directly.)</p>
+
+<h2>Usage</h2>
+<p>The API is static, so there is nothing to instantiate. Call <code>Register()</code> once from
+<code>InitializeSystem()</code>; you can log from anywhere, on any thread, even before
+<code>Register()</code> runs (early entries are kept and shown once the page is up).</p>
+
+<pre><code>using CwsDebug;
+
+public class ControlSystem : CrestronControlSystem
+{
+    public override void InitializeSystem()
+    {
+        CwsDebugPage.Register("/debugger");          // default base path; buffer defaults to 2000 entries
+        // CwsDebugPage.Register("/debugger", 5000);  // optional: larger ring buffer
+        // CwsDebugPage.MinLevel = CwsDebugPage.DebugLevel.Notice;  // optional: drop anything below Notice
+
+        CwsDebugPage.LogInfo("System starting");
+        CwsDebugPage.LogNotice("Loaded {0} devices", deviceCount);
+        CwsDebugPage.LogWarning("Low buffer on {0}", deviceName);
+        CwsDebugPage.LogError("Comms timeout on {0}", deviceName);
+        CwsDebugPage.LogFatal("Unrecoverable: {0}", reason);   // also written to the system ErrorLog
+    }
+
+    public override void InitializeSystem_Example_Catch()
+    {
+        try { /* ... */ }
+        catch (Exception e)
+        {
+            CwsDebugPage.LogException(e, "Error during init");  // full type + message + stack trace
+        }
+    }
+}</code></pre>
+
+<p>Cleanup is automatic &mdash; the library releases the CWS server and flushes the log to disk when
+the program stops or restarts &mdash; so calling <code>Dispose()</code>/<code>Shutdown()</code> by hand
+is optional.</p>
+
+<h3>Browsing to the page</h3>
+<table class="api">
+  <tr><th>Platform</th><th>URL</th></tr>
+  <tr><td>Appliance (RMC4, etc.)</td><td><code>http://&lt;processor&gt;/cws/debugger/debugger.html</code></td></tr>
+  <tr><td>VC-4 (Server)</td><td><code>http://&lt;processor&gt;/VirtualControl/Rooms/&lt;roomId&gt;/cws/debugger.html</code></td></tr>
+</table>
+
+<h3>API reference</h3>
+<p>All members are <code>static</code> on <code>CwsDebugPage</code>.</p>
+<table class="api">
+  <tr><th>Member</th><th>Description</th></tr>
+  <tr><td><code>LogInfo(msg, args)</code></td><td>Records an informational message.</td></tr>
+  <tr><td><code>LogNotice(msg, args)</code></td><td>Records a notice-level message.</td></tr>
+  <tr><td><code>LogWarning(msg, args)</code></td><td>Records a warning-level message. <em>(new in 1.2.0)</em></td></tr>
+  <tr><td><code>LogError(msg, args)</code></td><td>Records an error-level message.</td></tr>
+  <tr><td><code>LogFatal(msg, args)</code></td><td>Records a fatal message and mirrors it to the system error log.</td></tr>
+  <tr><td><code>LogException(ex, context?)</code></td><td>Records an exception at Error level with its full type, message and stack trace (and inner exceptions). <em>(new in 1.2.0)</em></td></tr>
+  <tr><td><code>Register(basePath, maxEntries?)</code></td><td>Starts the CWS server. <code>basePath</code> defaults to <code>"/debugger"</code>; <code>maxEntries</code> defaults to <code>2000</code> (values &le; 0 are ignored).</td></tr>
+  <tr><td><code>MinLevel</code> <span class="badge" style="background:#6b7280">PROP</span></td><td>Minimum severity recorded (<code>DebugLevel</code> = Info, Notice, Warning, Error, Fatal). Below-floor messages are dropped at the source. Defaults to <code>Info</code>. <em>(new in 1.2.0)</em></td></tr>
+  <tr><td><code>LoggingEnabled</code> <span class="badge" style="background:#6b7280">PROP</span></td><td>Master record switch. When <code>false</code>, all <code>Log*</code> calls are no-ops (fatals are still mirrored to the system ErrorLog). Persisted across restarts. Defaults to <code>true</code>. <em>(new in 1.2.0)</em></td></tr>
+  <tr><td><code>Dispose()</code> / <code>Shutdown()</code></td><td>Stops the server, flushes the log, releases resources. Idempotent and optional (cleanup is automatic).</td></tr>
+</table>
+<p>Each <code>Log*</code> method accepts an optional <code>string.Format</code> template plus
+arguments, e.g. <code>CwsDebugPage.LogInfo("Connected to {0}:{1}", host, port);</code></p>
+
+<h2>Configuration &amp; persistence</h2>
+<ul>
+  <li><strong>Buffer size:</strong> the log is a bounded ring buffer; once full, the oldest line is
+      dropped as each new one arrives. Size it per program with
+      <code>Register("/debugger", maxEntries)</code> (default 2000). This bounds both memory and the
+      JSON payload sent to the page.</li>
+  <li><strong>Severity floor (<code>MinLevel</code>):</strong> drops sub-threshold messages before they
+      are ever stored &mdash; distinct from the page's level-filter buttons, which only hide
+      already-recorded entries in the browser.</li>
+  <li><strong>Master switch (<code>LoggingEnabled</code> / "Logging" button):</strong> turns recording on
+      for a debugging session and off when finished. The state is persisted, so it survives a restart.
+      When off, the page status shows "LOGGING OFF".</li>
+  <li><strong>Persistence:</strong> the buffer is mirrored to the application directory
+      (<code>cwsdebug_&lt;path&gt;.log</code>, plus <code>.state</code> for the switch) every few seconds when
+      changed and once on program stop, then reloaded on the next <code>Register()</code> &mdash; so recent
+      history survives a restart.</li>
+  <li><strong>Pause:</strong> a page-side control that freezes polling/rendering. Recording continues on
+      the processor, so resuming shows everything logged during the freeze (subject to the ring cap).</li>
+</ul>
+
+<h2>Platform behavior</h2>
+<ul>
+  <li><strong>Base path (VC-4):</strong> with the default base path, the redundant segment is
+      collapsed so the page is served directly at <code>.../cws/debugger.html</code>. Passing an
+      explicit (non-default) base path keeps it in the URL on every platform &mdash; required if a
+      single program hosts more than one debug page.</li>
+  <li><strong>Concurrent rooms (VC-4):</strong> each room is an isolated program instance with its
+      own CWS namespace and its own log, so multiple rooms run side-by-side without conflict.</li>
+  <li><strong>Header title:</strong> shown as <code>"{Name} - Debugger"</code>, where Name is the
+      <em>room name</em> on VC-4 and the <em>host program's namespace/assembly name</em> on an
+      appliance, falling back to the controller prompt name, then the base-path segment, then
+      "Debugger".</li>
+  <li><strong>Processor error log:</strong> read via the console <code>err</code> command and shown
+      only on a hardware appliance; the feature is hidden on VC-4, where no per-program console
+      error log exists.</li>
+</ul>
+
+<div class="foot">
+  CwsDebug 1.2.0 &nbsp;&bull;&nbsp; Mark Jervis &nbsp;&bull;&nbsp; Stage Front Presentation Systems
+  &nbsp;&bull;&nbsp; Generated 2026-06-09
+</div>
+
+</body>
+</html>
