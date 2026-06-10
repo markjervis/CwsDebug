@@ -119,8 +119,7 @@ dotnet build CwsDebug/CwsDebug.csproj -c Release
 
 ## Documentation
 
-A formatted reference is included: [`CwsDebug_Documentation.html`](CwsDebug_Documentation.html)
-(and a rendered `CwsDebug_Documentation.pdf`).
+A formatted reference is included: [`CwsDebug_Documentation.pdf`](CwsDebug_Documentation.pdf).
 
 ## License
 
