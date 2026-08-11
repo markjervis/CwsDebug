@@ -111,6 +111,16 @@ Each `Log*` method accepts an optional `string.Format` template plus arguments, 
 - **Processor error log:** read via the console `err` command and shown only on a hardware
   appliance; hidden on VC-4, where no per-program console error log exists.
 
+## A note on network access
+
+The debug page has no login. Anyone who can reach the processor on the network can open the
+page, read the log, clear it, or switch logging off — the same way Crestron's own built-in
+web pages work. On a dedicated control-system network this is normally fine. If the processor
+sits on a network shared with general office traffic or guests, keep in mind that the log is
+visible to everyone on that network — so avoid logging passwords, door codes, or anything else
+sensitive, and ask your IT/network administrator to place the processor on a restricted VLAN
+if that's a concern.
+
 ## Building
 
 ```bash
@@ -120,6 +130,7 @@ dotnet build CwsDebug/CwsDebug.csproj -c Release
 ## Documentation
 
 A formatted reference is included: [`CwsDebug_Documentation.pdf`](CwsDebug_Documentation.pdf).
+Release history is tracked in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
