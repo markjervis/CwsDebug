@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.2.0
+//  Version:  1.2.1
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -13,6 +13,7 @@
 // -----------------------------------------------------------------------------
 
 using System.Reflection;            // Assembly.GetCallingAssembly() — host program name
+using System.Runtime.CompilerServices; // [MethodImpl(NoInlining)] — keeps GetCallingAssembly honest
 using System.Text;                  // StringBuilder for JSON responses
 using System.Text.RegularExpressions; // parsing the console "err" output
 using Crestron.SimplSharp;          // CrestronEnvironment, ErrorLog, InitialParametersClass, CTimer
@@ -81,7 +82,7 @@ namespace CwsDebug
         }
 
         private HttpCwsServer? _server;                     // null until Register() runs; guards double-registration
-        private readonly List<LogEntry> _log  = new();      // in-memory ring of application log entries (capped at MaxEntries)
+        private readonly List<LogEntry> _log  = new();      // in-memory ring; holds >= _maxEntries, transiently up to ~10% more (see Append)
         private readonly object         _lock = new();      // guards _log against concurrent CWS request threads
         private bool   _disposed;                           // true once the server has been torn down
         private bool   _errorLogAvailable;                  // true only on a hardware appliance (see Register)
@@ -116,7 +117,7 @@ namespace CwsDebug
         private const string DefaultBasePath = "/debugger";
 
         // Library version, shown in the page header. Keep in step with the .csproj <Version>.
-        private const string Version = "1.2.0";
+        private const string Version = "1.2.1";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -132,12 +133,14 @@ namespace CwsDebug
         /// it is full. It defaults to DefaultMaxEntries (2000). A value &lt;= 0 is ignored and the
         /// default is kept.
         /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
         public static void Register(string basePath = DefaultBasePath, int maxEntries = DefaultMaxEntries)
         {
             // The "friendly name" used in the appliance header is the namespace/assembly name
             // of the program that imported this library. Capture it HERE, in the public entry
             // point, so GetCallingAssembly resolves to the caller's program and not this dll —
-            // reading it inside RegisterInternal would return CwsDebug.dll instead.
+            // reading it inside RegisterInternal would return CwsDebug.dll instead. NoInlining
+            // (above) stops the JIT from folding this frame away and skewing that resolution.
             string? hostName;
             try { hostName = Assembly.GetCallingAssembly().GetName().Name; }
             catch { hostName = null; }
@@ -147,6 +150,13 @@ namespace CwsDebug
         // Actual registration, run against the singleton instance. hostName is supplied by the
         // static Register() above (see the note there on why the caller must capture it).
         private void RegisterInternal(string basePath, string? hostName, int maxEntries)
+        {
+            // Serialize the whole registration under _gate: two concurrent Register() calls must
+            // not both pass the _server null-check and double-create servers/timers.
+            lock (_gate) RegisterLocked(basePath, hostName, maxEntries);
+        }
+
+        private void RegisterLocked(string basePath, string? hostName, int maxEntries)
         {
             if (_server != null) return;
             var path = '/' + basePath.Trim('/');
@@ -179,16 +189,38 @@ namespace CwsDebug
             // application directory (persistent on both appliance and VC-4) and is namespaced by the
             // base path so two pages in one program don't share a file. Load any prior contents now,
             // then start the periodic flush; a final flush also runs on program stop (see Cleanup).
-            _persistPath = Path.Combine(Directory.GetApplicationDirectory(),
-                "cwsdebug" + path.Replace('/', '_') + ".log");
-            _statePath   = _persistPath + ".state";
-            LoadLoggingState();
-            LoadPersisted();
-            _flushTimer = new CTimer(_ => FlushToDisk(), FlushIntervalMs, FlushIntervalMs);
+            // Persistence is initialized exactly once, even if a failed registration is retried —
+            // re-running LoadPersisted() would merge the file into a buffer that already contains
+            // it and duplicate every line. The timer keeps running after a failed registration on
+            // purpose: the page may be unavailable, but the log still survives restarts.
+            if (_persistPath == null)
+            {
+                _persistPath = Path.Combine(Directory.GetApplicationDirectory(),
+                    "cwsdebug" + path.Replace('/', '_') + ".log");
+                _statePath   = _persistPath + ".state";
+                LoadLoggingState();
+                LoadPersisted();
+                _flushTimer = new CTimer(_ => FlushToDisk(), FlushIntervalMs, FlushIntervalMs);
+            }
 
-            _server = new HttpCwsServer(registerPath);
-            _server.HttpRequestHandler = this;
-            _server.Register();
+            var server = new HttpCwsServer(registerPath);
+            server.HttpRequestHandler = this;
+            try
+            {
+                server.Register();
+            }
+            catch (Exception e)
+            {
+                // Most likely another program on this appliance already registered the same
+                // path (e.g. two programs both left at the default "/debugger"). Log it and
+                // leave _server null so a bad registration never masquerades as a working one
+                // (see RegisterInternal's "if (_server != null) return;" guard above).
+                ErrorLog.Error("CwsDebugPage: failed to register CWS path \"{0}\" — {1}", registerPath, e.Message);
+                try { server.Dispose(); } catch { /* best-effort */ }
+                return;
+            }
+
+            _server = server;
         }
 
         // Header name: the room name on VC-4, and on an appliance the namespace/assembly name
@@ -276,8 +308,27 @@ namespace CwsDebug
         /// <summary>Records a fatal message and also writes it to the processor error log.</summary>
         public static void LogFatal (string message, params object[] args)
         {
-            ErrorLog.Error(message, args);          // mirror fatals to the system error log
-            Instance.Append("Fatal", message, args);
+            // Format once (safely), then mirror the finished text through a "{0}" template so a
+            // message containing literal braces can't throw a FormatException out of ErrorLog's
+            // own format pass. A logging call must never crash the caller.
+            var msg = SafeFormat(message, args);
+            try { ErrorLog.Error("{0}", msg); } catch { /* never let logging throw */ }
+            Instance.Append("Fatal", msg, Array.Empty<object>());
+        }
+
+        // string.Format that never throws back into the caller: a mismatched template/args pair
+        // (e.g. LogInfo("{0} {1}", x)) or stray braces fall back to the raw template with the
+        // args appended, so a malformed log call still records something rather than crashing
+        // the program at its least-expected point — inside a logging statement.
+        private static string SafeFormat(string message, object[] args)
+        {
+            if (args == null || args.Length == 0) return message;   // null: caller passed (object[])null
+            try { return string.Format(message, args); }
+            catch   // broad on purpose: an arg's ToString()/IFormattable can throw too
+            {
+                try   { return message + " [" + string.Join(", ", args) + "]"; }
+                catch { return message; }   // even Join can throw via ToString(); keep the template
+            }
         }
 
         /// <summary>
@@ -302,12 +353,17 @@ namespace CwsDebug
             if (!_loggingEnabled) return;           // master switch off — record nothing
             if (RankOf(level) < MinLevel) return;   // below the configured floor — drop it entirely
 
-            var msg = args.Length > 0 ? string.Format(message, args) : message;
+            var msg = SafeFormat(message, args);
             var ts  = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
             lock (_lock)
             {
                 _log.Add(new LogEntry(level, msg, ts, ++_seq));
-                if (_log.Count > _maxEntries) _log.RemoveRange(0, _log.Count - _maxEntries);
+                // Ring cap: trimming a List from the front is O(count), so rather than paying that
+                // on every append once full, let the buffer grow one chunk (~10%) past the cap and
+                // trim back down in a single operation — amortized O(1) per append. The buffer never
+                // holds fewer than _maxEntries; it just transiently holds up to ~10% more.
+                var chunk = Math.Max(1, _maxEntries / 10);
+                if (_log.Count >= _maxEntries + chunk) _log.RemoveRange(0, _log.Count - _maxEntries);
                 _dirty = true;
             }
         }
@@ -363,12 +419,24 @@ namespace CwsDebug
             catch { since = 0; }
 
             // Copy under the lock, then build the response outside it to keep the lock short.
+            // Entries are Seq-ordered, so the incremental case binary-searches for the first
+            // entry newer than the cursor instead of scanning the whole buffer.
             List<LogEntry> snapshot;
             long lastSeq;
             lock (_lock)
             {
-                snapshot = since > 0 ? _log.FindAll(e => e.Seq > since) : new List<LogEntry>(_log);
-                lastSeq  = _seq;
+                if (since > 0)
+                {
+                    int lo = 0, hi = _log.Count;
+                    while (lo < hi)
+                    {
+                        int mid = (lo + hi) / 2;
+                        if (_log[mid].Seq > since) hi = mid; else lo = mid + 1;
+                    }
+                    snapshot = _log.GetRange(lo, _log.Count - lo);
+                }
+                else snapshot = new List<LogEntry>(_log);
+                lastSeq = _seq;
             }
 
             var sb = new StringBuilder();
@@ -483,6 +551,15 @@ namespace CwsDebug
                 var task  = m.Groups[2].Value.Trim();
                 var ts    = m.Groups[3].Value.Trim();
                 var msg   = m.Groups[4].Value.Trim();
+
+                // Reformat the console timestamp to the application log's format so the page's
+                // chronological merge (a string sort on ts) orders both sources correctly.
+                // Invariant culture: a culture-sensitive parse could silently swap day/month on
+                // an ambiguous console date and mis-sort — worse than keeping it verbatim.
+                // An unparseable timestamp is kept verbatim rather than dropped.
+                if (DateTime.TryParse(ts, System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var dt))
+                    ts = dt.ToString("yyyy-MM-dd HH:mm:ss.fff");
                 if (task.Length > 0) msg = task + ": " + msg;   // prefix the originating task
 
                 result.Add(new LogEntry(level, msg, ts, 0));     // Seq is N/A for processor-log lines
@@ -498,13 +575,32 @@ namespace CwsDebug
             return char.ToUpper(s[0]) + (s.Length > 1 ? s.Substring(1).ToLower() : string.Empty);
         }
 
-        // Minimal JSON string encoder: wraps in quotes and escapes the characters that would
-        // otherwise break the response (backslash, quote, CR, LF). Sufficient for log text.
-        private static string JsonString(string s) =>
-            '"' + s.Replace("\\", "\\\\")
-                   .Replace("\"", "\\\"")
-                   .Replace("\r", "\\r")
-                   .Replace("\n", "\\n") + '"';
+        // Minimal JSON string encoder: wraps in quotes and escapes backslash, quote and ALL
+        // control characters (U+0000–U+001F). Raw control chars — a tab is the likely one in
+        // log text — are illegal inside JSON strings and make the browser's JSON.parse reject
+        // the whole response, so every one must be escaped, not just CR/LF.
+        private static string JsonString(string s)
+        {
+            var sb = new StringBuilder(s.Length + 2);
+            sb.Append('"');
+            foreach (var c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"':  sb.Append("\\\""); break;
+                    case '\r': sb.Append("\\r");  break;
+                    case '\n': sb.Append("\\n");  break;
+                    case '\t': sb.Append("\\t");  break;
+                    default:
+                        if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
+        }
 
         // ── Persistence ────────────────────────────────────────────────────────────────
         // The application log is mirrored to a file so it survives a program restart. The on-disk
@@ -538,6 +634,8 @@ namespace CwsDebug
 
                 lock (_lock)
                 {
+                    var hadPreRegister = _log.Count > 0;         // entries logged before Register()
+
                     var merged = new List<LogEntry>(loaded);
                     merged.AddRange(_log);                       // keep anything logged before Register()
                     if (merged.Count > _maxEntries)
@@ -547,7 +645,10 @@ namespace CwsDebug
                     _seq = 0;
                     foreach (var e in merged)
                         _log.Add(new LogEntry(e.Level, e.Message, e.Timestamp, ++_seq));
-                    _dirty = false;                              // freshly loaded state matches disk
+                    // Pre-Register() entries have never been written to disk, so the buffer only
+                    // matches disk when there were none. Leaving _dirty false here would let those
+                    // entries be lost on restart if nothing else ever logged (flushes would no-op).
+                    _dirty = hadPreRegister;
                 }
             }
             catch { /* corrupt/unreadable persisted log is non-fatal */ }
@@ -701,7 +802,9 @@ namespace CwsDebug
         // error-log availability flag) into the static template below.
         private static string BuildHtml(string pageTitle, bool errorLogAvailable, bool loggingEnabled, int maxEntries)
         {
-            var heading = pageTitle + " - Debugger";
+            // The title comes from outside the library (room name / assembly name), so encode it —
+            // a name containing '<' or '&' must render as text, not be parsed as markup.
+            var heading = HtmlEncode(pageTitle + " - Debugger");
             return BuildHtmlTemplate()
                 .Replace("__TITLE__", heading)
                 .Replace("__VERSION__", Version)
@@ -709,6 +812,10 @@ namespace CwsDebug
                 .Replace("__LOGGING__", loggingEnabled ? "true" : "false")
                 .Replace("__MAXENTRIES__", maxEntries.ToString());
         }
+
+        // Minimal HTML encoder for values substituted into the page template.
+        private static string HtmlEncode(string s) =>
+            s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
 
         // The complete single-page UI (markup + CSS + JavaScript) as a verbatim string, so the
         // library has no external content files to deploy. Placeholders __TITLE__ / __ERRORLOG__
@@ -854,18 +961,30 @@ function render(entries){
 function applyFilter(){
   render(visibleEntries());
 }
+var needRender=false;  // persists across polls: set when data changes, cleared only by a render.
+                       // If one fetch of a poll succeeds (appending entries / advancing lastSeq)
+                       // but a sibling fetch rejects, the flag survives so the NEXT successful
+                       // poll paints the stranded entries instead of losing them until new data.
 function refresh(){
   var tasks=[fetch('api/logs?since='+lastSeq).then(function(r){return r.json();}).then(function(d){
     if(d.entries&&d.entries.length){
+      needRender=true;
       debuggerEntries=debuggerEntries.concat(d.entries);
       // bound client memory to the server ring size; the server already bounds what it sends
       if(debuggerEntries.length>CLIENT_MAX) debuggerEntries=debuggerEntries.slice(debuggerEntries.length-CLIENT_MAX);
     }
     if(typeof d.lastSeq==='number') lastSeq=d.lastSeq;
   })];
-  if(showProc) tasks.push(fetch('api/errorlog').then(function(r){return r.json();}).then(function(d){processorEntries=d.entries||[];}));
+  if(showProc) tasks.push(fetch('api/errorlog').then(function(r){return r.json();}).then(function(d){
+    var next=d.entries||[];
+    // content compare, not length: the console error log is a bounded ring, so once full a
+    // new entry displaces the oldest and the line count stays identical. The log is small
+    // (bounded console buffer), so a stringify compare per poll is cheap and bulletproof.
+    if(JSON.stringify(next)!==JSON.stringify(processorEntries)) needRender=true;
+    processorEntries=next;
+  }));
   Promise.all(tasks).then(function(){
-    applyFilter();
+    if(needRender){applyFilter();needRender=false;}
     var note=LOGGING_ENABLED?'':'  — LOGGING OFF';
     document.getElementById('status').textContent='Updated '+new Date().toLocaleTimeString()+note;
   }).catch(function(){document.getElementById('status').textContent='Connection error';});
@@ -905,6 +1024,7 @@ function toggleSource(which){
   document.getElementById('appBtn').classList.toggle('on',showApp);
   document.getElementById('procBtn').classList.toggle('on',showProc);
   try{localStorage.setItem('dbg-show-app',showApp?'1':'0');localStorage.setItem('dbg-show-proc',showProc?'1':'0');}catch(x){}
+  applyFilter();   // re-render now with the new source mix; refresh() only renders on new data
   refresh();
 }
 function toggleLevel(name){
@@ -969,6 +1089,7 @@ function toggleLogging(){
     if(b) b.classList.toggle('on',levelOn[n]);
   });
 })();
+applyFilter();   // initial paint (shows ""No entries."" until the first poll lands)
 refresh();
 pollTimer=setInterval(refresh,2000);
 </script>
