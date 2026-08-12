@@ -22,6 +22,10 @@ files to deploy. It builds as a **Program Library** and is referenced by your SI
 - **Pause** control on the page (recording continues on the processor while paused).
 - **Millisecond timestamps** and incremental polling (only new entries are fetched).
 - **Processor error log** view on hardware appliances (read via the console `err` command).
+- **Signals panel** — register a touchpanel with one line and view or force its joins live from
+  the page, Toolbox-style: digital (high / low / pulse), analog and serial, plus Smart Graphics
+  object signals picked by their SGD names. Forcing sits behind an arm switch and every force is
+  recorded in the log.
 
 ## Requirements
 
@@ -95,9 +99,56 @@ All members are `static` on `CwsDebugPage`.
 | `MinLevel` *(property)*             | Minimum severity recorded (`DebugLevel`: Info, Notice, Warning, Error, Fatal). Defaults to Info. |
 | `LoggingEnabled` *(property)*       | Master record switch. Persisted across restarts. Defaults to `true`.                             |
 | `Dispose()` / `Shutdown()`          | Stops the server, flushes the log, releases resources. Idempotent and optional.                  |
+| `RegisterDevice(name, device)`      | Exposes a device's joins in the Signals panel. Any `BasicTriList` (XPanel, TSW, …).              |
+| `UnregisterDevice(name)`            | Drops a device. Call before disposing it.                                                        |
+| `UnregisterAllDevices()`            | Drops every registered device.                                                                   |
+| `ValueWritesAllowed` *(property)*   | Master switch for forcing. `false` leaves the panel read-only. Defaults to `true`.               |
+| `ValueWritesArmed` *(property)*     | Arm gate for forcing. Defaults to `false` at every program start; never persisted.               |
+| `ValueArmTimeoutMs` *(property)*    | Idle timeout before forcing disarms itself. Defaults to 300000 (5 min); `<= 0` disables it.      |
 
 Each `Log*` method accepts an optional `string.Format` template plus arguments, e.g.
 `CwsDebugPage.LogInfo("Connected to {0}:{1}", host, port);`
+
+## Signals panel
+
+Register a device once, and its joins become browsable and forceable from the page:
+
+```csharp
+public override void InitializeSystem()
+{
+    CwsDebugPage.Register("/debugger");
+    CwsDebugPage.RegisterDevice("Panel", tsPanel);   // any BasicTriList
+}
+```
+
+Call `UnregisterDevice` before disposing the device — a program's own stop handler usually runs
+before the library's, so the page can otherwise briefly reach a disposed panel:
+
+```csharp
+CwsDebugPage.UnregisterDevice("Panel");
+panel.Dispose();
+```
+
+Open **Signals** on the page and add a signal by device, type (Digital / Analog / Serial) and
+direction:
+
+- **Out** — the program's value going *to* the panel: button feedback, gauge levels, indirect
+  text. This is the side that can be forced.
+- **In** — what the panel sends *back*: presses and slider moves. Read-only, since a panel's
+  output signals cannot be written.
+- **Both** — one row showing a join's two directions together.
+
+Enter a **Smart Object ID** to reach a Smart Graphics object, and its signals are listed by their
+SGD names (`Item 1 Pressed`, `Select Item`, `Item 1 Text`) rather than by number. Rows can be
+given friendly names, and the list is remembered in the browser.
+
+Digital rows show the signal's state and light a lamp while it is high, with force buttons for
+**High**, **Low** and **Pulse**; analog and serial rows are edited by typing a value and pressing
+Enter. Forcing writes to the join itself — unlike Toolbox there is no separate "unforce", so the
+value stands until the program or the panel changes it again.
+
+Forcing is disabled until it is armed on the page, and arming lapses after five idle minutes or
+whenever the program restarts. Every force is recorded in the log with the address it came from.
 
 ## Platform behavior
 
@@ -111,6 +162,12 @@ Each `Log*` method accepts an optional `string.Format` template plus arguments, 
 - **Processor error log:** read via the console `err` command and shown only on a hardware
   appliance; hidden on VC-4, where no per-program console error log exists.
 
+## Roadmap
+
+- **Crestron Construct Contracts** *(planned)* — support for panels built with Crestron
+  Construct, addressing signals through the project's Contract definitions the same way
+  Smart Graphics signals are addressed through the SGD today.
+
 ## A note on network access
 
 The debug page has no login. Anyone who can reach the processor on the network can open the
@@ -120,6 +177,13 @@ sits on a network shared with general office traffic or guests, keep in mind tha
 visible to everyone on that network — so avoid logging passwords, door codes, or anything else
 sensitive, and ask your IT/network administrator to place the processor on a restricted VLAN
 if that's a concern.
+
+The same applies to the Signals panel, which can change values on a running system. Forcing is
+switched off until someone arms it, arming is forgotten whenever the program restarts or the
+page is reloaded, it switches itself back off after five idle minutes, and every force is
+written to the log with the address of the machine that sent it. For a system being handed over,
+set `CwsDebugPage.ValueWritesAllowed = false` to leave the panel read-only while keeping the
+live view.
 
 ## Building
 

@@ -3,6 +3,34 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] - 2026-08-11
+
+### Added
+- **Signals panel** — a device's joins can be viewed and forced live from the debug page,
+  alongside the log. `CwsDebugPage.RegisterDevice(name, device)` exposes any `BasicTriList`
+  (XPanel, TSW, and other touchpanels); `UnregisterDevice` / `UnregisterAllDevices` release it.
+- Digital, analog and serial joins in both directions, plus Smart Graphics object signals
+  addressed by their SGD names. Joins that exist in both directions can be shown as a single
+  paired row.
+- Forcing: **High**, **Low** and **Pulse** on digital joins, and typed values on analog and
+  serial joins. Signals coming *from* a panel are read-only, since output signals cannot be
+  written.
+- Force safety: `ValueWritesAllowed` disables forcing entirely for a handed-over system;
+  forcing is otherwise off until armed on the page, arming is never persisted and lapses after
+  `ValueArmTimeoutMs` (default 5 minutes) of inactivity; every force and every refusal is
+  written to the log with the requesting address, regardless of the logging switch or severity
+  floor.
+- The signal list is built on the page, with friendly names per row, and is remembered in the
+  browser rather than declared in the program.
+- Panel layout: the signals panel and the log sit side by side with a draggable divider.
+
+### Changed
+- The `APP` / `SYS` source tag on log rows is shown only when both log sources are displayed.
+- Buttons, dropdowns and fields across the page have hover help.
+
+### Requirements
+- Adds a reference to `Crestron.SimplSharpPro.DeviceSupport`.
+
 ## [1.2.1] - 2026-08-11
 
 ### Fixed
