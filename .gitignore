@@ -25,3 +25,6 @@ debugger_screenshot.png
 Thumbs.db
 ehthumbs.db
 .DS_Store
+
+# Screenshots (kept local only)
+signals_screenshot.png
