@@ -3,6 +3,28 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.0] - 2026-08-12
+
+### Added
+- **Signal logging** — each signal in the Signals panel has a **Log** toggle. With it on, the
+  processor writes a line every time that signal changes (`Signal XPanel Power Button (od1) ->
+  true`), so a join can be followed without adding anything to the program. Lines come from the
+  processor, so they carry the moment the change happened and include transitions too brief to
+  fall on a poll. Digital edges always log; analog and serial have a floor between entries so a
+  dragged slider cannot flood the buffer. Logging stops by itself shortly after the page stops
+  asking, and the master logging switch and severity floor still apply.
+
+### Changed
+- Signals poll on their own 250 ms cadence rather than the log's two seconds, so a button press
+  reaches the page in about a quarter of a second. One request is in flight at a time, so a slow
+  connection throttles itself instead of queueing.
+- The page stops requesting updates while its tab is hidden, and after fifteen minutes in which
+  neither the user touched the page nor any value arrived. Arriving values count as activity, so
+  watching a panel being pressed never suspends it. It resumes on a click, a keystroke, or the
+  tab being shown.
+- The Logging and Pause tooltips now state which one is a recording switch on the processor and
+  which one stops the page requesting updates.
+
 ## [1.3.0] - 2026-08-11
 
 ### Added

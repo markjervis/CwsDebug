@@ -26,6 +26,8 @@ files to deploy. It builds as a **Program Library** and is referenced by your SI
   the page, Toolbox-style: digital (high / low / pulse), analog and serial, plus Smart Graphics
   object signals picked by their SGD names. Forcing sits behind an arm switch and every force is
   recorded in the log.
+- **Signal logging** — switch on `Log` for any signal in the panel and every change of it is
+  written to the log, without adding anything to the program.
 
 ## Requirements
 
@@ -147,8 +149,39 @@ Digital rows show the signal's state and light a lamp while it is high, with for
 Enter. Forcing writes to the join itself — unlike Toolbox there is no separate "unforce", so the
 value stands until the program or the panel changes it again.
 
+Each row also has a **Log** toggle. With it on, the processor writes a line to the log every time
+that signal changes:
+
+```
+Signal Panel Power Button (od1) -> true
+Signal Panel Volume (a1) -> 46536
+```
+
+That gives a running trace of any join without adding a single `Log*` call to the program. The
+lines are written on the processor, so they carry the moment the change happened and catch
+transitions too brief to land on a poll. Digital edges are always logged; analog and serial have a
+floor between entries so a dragged slider cannot flood the buffer. Logging a signal stops shortly
+after the page stops asking for it, so closing the browser cannot leave a processor logging
+indefinitely.
+
 Forcing is disabled until it is armed on the page, and arming lapses after five idle minutes or
 whenever the program restarts. Every force is recorded in the log with the address it came from.
+
+### What stops the page updating
+
+Three things are easy to confuse:
+
+| Control | What it stops |
+|---------|---------------|
+| **Logging** | Recording on the processor. It does *not* stop the page requesting updates. |
+| **Pause** | The page requesting updates. The processor keeps recording; resuming catches up. |
+| *(automatic)* | Requests, while the tab is hidden and after fifteen idle minutes. |
+
+Signals refresh about four times a second while the panel is open, so a button press shows up in
+roughly a quarter of a second; the log refreshes every two seconds. Only one request is ever in
+flight, so a slow connection simply refreshes less often. The automatic stop treats arriving
+values as activity, so watching a panel being pressed keeps the page live even with no mouse or
+keyboard use; it resumes on a click, a keystroke, or the tab being shown.
 
 ## Platform behavior
 

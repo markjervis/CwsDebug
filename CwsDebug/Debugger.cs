@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.3.0
+//  Version:  1.4.0
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -125,6 +125,8 @@ namespace CwsDebug
         private const int MaxWatchKeys      = 128;          // per-request cap; the watch set is client-supplied
         private const int JoinCacheMax      = 512;          // resolution-cache bound
         private const int JoinCacheEvictMs  = 300000;       // entries idle this long are evicted (5 min)
+        private const int TraceTtlMs        = 15000;        // tracing lapses this long after the page last asked
+        private const int TraceMinGapMs     = 100;          // floor between analog/serial trace entries
 
         // ── Force gating (Phase 2) ─────────────────────────────────────────────────────
         // Forces mutate a live control system from an unauthenticated page, so they sit
@@ -161,7 +163,7 @@ namespace CwsDebug
         private const string DefaultBasePath = "/debugger";
 
         // Library version, shown in the page header. Keep in step with the .csproj <Version>.
-        private const string Version = "1.3.0";
+        private const string Version = "1.4.0";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -619,19 +621,7 @@ namespace CwsDebug
                         // one unambiguous path beats a decode heuristic.
                         if (!v.StartsWith("b64:", StringComparison.Ordinal))
                         { WriteForceError(context, 400, "serial value must be base64url (\"b64:<data>\")", devName, k, v); return; }
-                        string text;
-                        try
-                        {
-                            var b = v.Substring(4).Replace('-', '+').Replace('_', '/');
-                            switch (b.Length % 4)
-                            {
-                                case 2: b += "=="; break;
-                                case 3: b += "=";  break;
-                                case 1: throw new FormatException();
-                            }
-                            text = Encoding.UTF8.GetString(Convert.FromBase64String(b));
-                        }
-                        catch
+                        if (!TryDecodeB64Url(v.Substring(4), out var text))
                         { WriteForceError(context, 400, "bad base64 serial value", devName, k, v); return; }
 
                         if (text.Length > 1024)
@@ -845,6 +835,8 @@ namespace CwsDebug
                 try { if (sig.Type == eSigType.Bool) countActivity = sig.BoolValue; } catch { }
 
                 var prefix = deviceName + "|";
+                List<string>? traces = null;
+                long nowMs = Environment.TickCount64;
                 lock (_devLock)
                 {
                     foreach (var kv in _joinCache)
@@ -854,8 +846,19 @@ namespace CwsDebug
                         if (slot.Sig == null || !ReferenceEquals(slot.Sig, sig)) continue;
                         if (countActivity) slot.Changes++;
                         slot.Rev = ++_joinRev;
+
+                        if (slot.Trace)
+                        {
+                            string? line = null;
+                            try { line = TraceLine(slot, kv.Key, RenderSlot(slot), nowMs); } catch { }
+                            if (line != null) (traces ??= new List<string>()).Add(line);
+                        }
                     }
                 }
+                // Emitted outside _devLock: Append takes _lock, and the ordering invariant is
+                // one-way. Keeping the event handler's critical section short matters here too.
+                if (traces != null)
+                    foreach (var line in traces) Append("Info", line, Array.Empty<object>());
             }
             catch { /* never throw into the device's event dispatch */ }
         }
@@ -883,6 +886,11 @@ namespace CwsDebug
             public long    Rev;                  // _joinRev at the last observed change
             public long    LastSeenMs;           // for cache eviction
             public int     Changes;              // SigChange count (outputs): makes sub-poll pulses visible
+            public bool    Trace;                // page asked for this signal to be logged
+            public long    TraceUntilMs;         // lapses when the page stops asking (browser closed)
+            public string  LastTraced = "";      // last value written to the log; de-duplicates the two sources
+            public long    LastTraceMs;          // rate limit for chatty analog/serial
+            public string? TraceLabel;           // the page's friendly name for this signal
         }
 
         // Parses and resolves one watch key against a device. Never throws: every failure —
@@ -988,6 +996,29 @@ namespace CwsDebug
 
         // Renders a slot's current value as its JSON token ("true", "42", "\"text\"").
         // The rendered string doubles as the change-detection comparand.
+        // Builds one "signal changed" log line when a traced slot's value actually changed
+        // since the last line written for it. Both the SigChange hook and the poll call this,
+        // and LastTraced stops them writing the same change twice - the hook catches
+        // panel-originated changes as they happen, the poll catches program-driven ones (a
+        // write to an input sig raises no event). Digital edges always log; analog and serial
+        // get a floor between entries so a dragged slider cannot flood the buffer. Returns
+        // null when nothing should be written; callers emit outside the lock.
+        private static string? TraceLine(WatchSlot slot, string cacheKey, string rendered, long nowMs)
+        {
+            if (!slot.Trace || nowMs > slot.TraceUntilMs) return null;
+            if (rendered == slot.LastTraced) return null;
+            if (slot.Type != 'd' && slot.LastTraceMs != 0 && nowMs - slot.LastTraceMs < TraceMinGapMs) return null;
+
+            slot.LastTraced  = rendered;
+            slot.LastTraceMs = nowMs;
+
+            var bar = cacheKey.IndexOf('|');
+            var dev = bar > 0 ? cacheKey.Substring(0, bar) : "?";
+            var key = bar > 0 ? cacheKey.Substring(bar + 1) : cacheKey;
+            var what = string.IsNullOrEmpty(slot.TraceLabel) ? key : slot.TraceLabel + " (" + key + ")";
+            return "Signal " + dev + " " + what + " -> " + rendered;
+        }
+
         private static string RenderSlot(WatchSlot slot) => slot.Type switch
         {
             'd' => slot.Sig!.BoolValue ? "true" : "false",
@@ -1048,13 +1079,14 @@ namespace CwsDebug
         private void ServeJoins(HttpCwsContext context)
         {
             long since = 0;
-            string? devName = null, w = null;
+            string? devName = null, w = null, t = null;
             try
             {
                 var raw = context.Request.QueryString["since"];
                 if (!string.IsNullOrEmpty(raw)) long.TryParse(raw, out since);
                 devName = context.Request.QueryString["dev"];
                 w       = context.Request.QueryString["w"];
+                t       = context.Request.QueryString["t"];
             }
             catch { /* malformed request — treated as empty below */ }
 
@@ -1064,6 +1096,30 @@ namespace CwsDebug
             var keys = w.Split(',');
             if (keys.Length > MaxWatchKeys)
             { WriteJsonError(context, 400, "too many watch keys"); return; }
+
+            // Which of these signals the page wants written to the log. Re-sent on every poll,
+            // so tracing lapses on its own once the page stops asking - closing the browser
+            // cannot leave a processor logging every transition forever.
+            // Entries are "key" or "key:<base64url label>" - the label is the name shown on
+            // the page, carried so the log reads in the same terms the user chose. base64url
+            // keeps a label containing a comma, colon or percent from breaking the list.
+            Dictionary<string, string?>? traced = null;
+            if (!string.IsNullOrEmpty(t))
+            {
+                traced = new Dictionary<string, string?>(StringComparer.Ordinal);
+                foreach (var k in t.Split(','))
+                {
+                    var tk = k.Trim();
+                    if (tk.Length == 0) continue;
+                    var colon = tk.IndexOf(':');
+                    if (colon < 0) { traced[tk] = null; continue; }
+                    var tkey = tk.Substring(0, colon);
+                    if (tkey.Length == 0) continue;
+                    traced[tkey] = TryDecodeB64Url(tk.Substring(colon + 1), out var lbl) && lbl.Length <= 64
+                        ? lbl : null;
+                }
+            }
+            var traceLines = new List<string>();
 
             var sb = new StringBuilder();
             lock (_devLock)
@@ -1093,6 +1149,16 @@ namespace CwsDebug
                     }
                     slot.LastSeenMs = nowMs;
 
+                    // Tracing is asserted per poll, so a row switched off stops at once and a
+                    // vanished browser stops within TraceTtlMs.
+                    string? traceLbl = null;
+                    slot.Trace = traced != null && traced.TryGetValue(key, out traceLbl);
+                    if (slot.Trace)
+                    {
+                        slot.TraceUntilMs = nowMs + TraceTtlMs;
+                        slot.TraceLabel = traceLbl;
+                    }
+
                     // Render the current value (or carry the stable resolution error); a sig
                     // read that throws (disposed device) becomes a per-row error, not a 500.
                     string rendered;
@@ -1103,6 +1169,12 @@ namespace CwsDebug
                         catch (Exception e) { err = "read failed: " + e.GetType().Name; rendered = ""; }
                     }
                     else rendered = "";
+
+                    if (err == null)
+                    {
+                        var line = TraceLine(slot, cacheKey, rendered, nowMs);
+                        if (line != null) traceLines.Add(line);
+                    }
 
                     var comparand = err != null ? "!" + err : rendered;
                     if (comparand != slot.LastRendered)
@@ -1138,6 +1210,9 @@ namespace CwsDebug
                 try { sb.Append(",\"online\":").Append(device.IsOnline ? "true" : "false"); } catch { }
                 sb.Append(",\"joins\":[").Append(entries).Append("]}");
             }
+
+            // Outside _devLock, per the ordering invariant.
+            foreach (var line in traceLines) Append("Info", line, Array.Empty<object>());
 
             context.Response.StatusCode  = 200;
             context.Response.ContentType = "application/json";
@@ -1478,6 +1553,27 @@ namespace CwsDebug
             if (string.IsNullOrEmpty(raw)) return "Info";
             var s = raw.Trim();
             return char.ToUpper(s[0]) + (s.Length > 1 ? s.Substring(1).ToLower() : string.Empty);
+        }
+
+        // Decodes a base64url payload (no padding, '-' and '_' for '+' and '/'). Used for text
+        // that travels in a query string: the alphabet contains no '+', '%' or space, so the
+        // value survives whatever URL-decoding CWS applies without a second guess.
+        private static bool TryDecodeB64Url(string raw, out string text)
+        {
+            text = "";
+            try
+            {
+                var b = raw.Replace('-', '+').Replace('_', '/');
+                switch (b.Length % 4)
+                {
+                    case 2: b += "=="; break;
+                    case 3: b += "=";  break;
+                    case 1: return false;
+                }
+                text = Encoding.UTF8.GetString(Convert.FromBase64String(b));
+                return true;
+            }
+            catch { return false; }
         }
 
         // Minimal JSON string encoder: wraps in quotes and escapes backslash, quote and ALL
@@ -1827,6 +1923,9 @@ body.light button:hover{background:#d1d5db}
 .wf:hover{background:var(--border)}
 .wf.off{opacity:.35;cursor:not-allowed}
 .wf.active{background:var(--bn-bg);color:var(--bn-fg);border-color:var(--bn-fg)}
+.wt{flex-shrink:0;font:bold 9px 'Courier New',monospace;letter-spacing:1px;padding:2px 5px;border-radius:2px;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--muted)}
+.wt:hover{background:var(--border)}
+.wt.on{background:var(--be-bg);color:var(--be-fg);border-color:var(--be-fg)}
 .wnum{width:80px;background:var(--search-bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:2px 6px;font:12px 'Courier New',monospace;outline:none}
 .wnum.dirty{border-color:var(--bw-fg)}
 .wnum.pending{border-color:var(--bn-fg);opacity:.6}
@@ -1844,8 +1943,8 @@ body.light button:hover{background:#d1d5db}
   <div class=""brand""><h1>__TITLE__</h1><span class=""ver"">v__VERSION__</span></div>
   <div class=""controls"">
     <span id=""status"">Loading...</span>
-    <button id=""logBtn"" class=""toggle on"" onclick=""toggleLogging()"" title=""Master recording switch on the processor. Off = nothing is stored (persists across restarts)."">Logging On</button>
-    <button id=""pauseBtn"" class=""toggle"" onclick=""togglePause()"" title=""Freeze this page. Recording continues on the processor; resuming catches up."">Pause</button>
+    <button id=""logBtn"" class=""toggle on"" onclick=""toggleLogging()"" title=""RECORDING switch on the processor: off means nothing is stored (persists across restarts). It does not stop this page updating - use Pause for that."">Logging On</button>
+    <button id=""pauseBtn"" class=""toggle"" onclick=""togglePause()"" title=""Stop this page requesting updates. The processor keeps recording; resuming catches up. The page also stops on its own when hidden or left idle."">Pause</button>
     <button id=""appBtn""  class=""toggle on"" onclick=""toggleSource('app')"" title=""Show/hide the program's own log messages."">Debugger</button>
     <button id=""procBtn"" class=""toggle"" onclick=""toggleSource('proc')"" title=""Show/hide the processor error log (console 'err')."">Error Log</button>
     <button id=""watchBtn"" class=""toggle"" onclick=""toggleWatch()"" title=""Open the signals panel: view and force device joins."">Signals</button>
@@ -2035,6 +2134,7 @@ function renderWatch(){
       h+=watchCell(e,j,e.key);
     }
     h+='<span style=""flex:1""></span>';
+    h+=traceBtnHtml(e);
     h+='<button class=""wx"" title=""Remove this signal from the list."" onclick=""removeWatch(\''+escAttr(e.dev)+'\',\''+escAttr(e.key)+'\')"">&times;</button>';
     row.innerHTML=h;
     el.appendChild(row);
@@ -2148,6 +2248,81 @@ function touchArm(){
     syncArm(!!d.armed,d.writesAllowed!==false);
   }).catch(function(){});
 }
+// The signals poll runs on its own, far faster cadence than the log. An unchanged reply is
+// ~70 bytes and the processor answers in single-digit milliseconds, so the constraint worth
+// respecting is one round in flight at a time rather than a fixed rate: that holds
+// press-to-screen latency near SIGNAL_POLL_MS and self-throttles over a slow link instead of
+// queueing requests.
+var SIGNAL_POLL_MS=250;
+var signalTimer=null, signalsInFlight=0;
+function pollSignals(){
+  if(!watchOpen||!watchList.length||paused)return;
+  if(signalsInFlight)return;                       // previous round still outstanding
+  var byDev={}, trcDev={};
+  watchList.forEach(function(e){
+    var arr=(byDev[e.dev]=byDev[e.dev]||[]);
+    arr.push(e.key);
+    if(e.pair)arr.push(oKey(e.key));               // paired rows read both directions
+    if(e.trace){
+      // ""key"" or ""key:<base64url label>"" - the name shown on the row travels with it so the
+      // log reads in the same terms, and base64url keeps a comma or colon in a name from
+      // breaking the list.
+      var tr=(trcDev[e.dev]=trcDev[e.dev]||[]);
+      var sfx=e.label?':'+b64url(e.label):'';
+      tr.push(e.key+sfx);
+      if(e.pair)tr.push(oKey(e.key)+sfx);          // a traced pair logs both halves
+    }
+  });
+  var devs=Object.keys(byDev);
+  signalsInFlight=devs.length;
+  var changed=false, flashed=false;
+  devs.forEach(function(dev){
+    var trc=trcDev[dev];
+    fetch('api/joins?since='+joinRev+'&dev='+encodeURIComponent(dev)+'&w='+encodeURIComponent(byDev[dev].join(','))+
+          (trc?'&t='+encodeURIComponent(trc.join(',')):''))
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.joins&&d.joins.length){
+          d.joins.forEach(function(j){
+            var id=dev+'|'+j.k;
+            var old=joinVals[id];
+            // chg counts rising edges server-side; shown as a 1s lamp, not a number
+            if(j.chg&&(!old||j.chg>(old.chg||0))){wflash[id]=Date.now()+1000;flashed=true;}
+            joinVals[id]=j;
+            // If this row's value changed WHILE its editor is focused, the live change wins:
+            // overwrite the box in place (renders are blocked during edits, so without this
+            // the box goes stale and Enter would force an outdated value back over a fresh
+            // panel change, e.g. a slider move).
+            if(id===editingWatch&&old&&!j.err&&String(old.v)!==String(j.v)){
+              var ae=document.activeElement;
+              if(ae&&(ae.className.indexOf('wnum')>=0||ae.className.indexOf('wtxt')>=0)){
+                ae.value=j.v;
+                ae.classList.remove('dirty');
+              }
+            }
+          });
+          changed=true;
+          lastActivity=Date.now();          // values moving means someone is working
+        }
+        if(typeof d.lastRev==='number'&&d.lastRev>joinRev) joinRev=d.lastRev;
+        if(typeof d.armed==='boolean') syncArm(d.armed,d.writesAllowed!==false);
+        if(typeof d.online==='boolean') setDevOnline(dev,d.online);
+      }).catch(function(){}).then(function(){
+        if(--signalsInFlight>0)return;
+        signalsInFlight=0;
+        if(changed||flashed)renderWatch();
+        if(flashed)setTimeout(renderWatch,1100);   // turn the lamp back off
+      });
+  });
+}
+function startSignals(){
+  stopSignals();
+  signalTimer=setInterval(pollSignals,SIGNAL_POLL_MS);
+  pollSignals();
+}
+function stopSignals(){
+  if(signalTimer){clearInterval(signalTimer);signalTimer=null;}
+  signalsInFlight=0;
+}
 function syncArm(a,w){
   if(a===armed&&w===writesAllowed)return;
   if(armed&&!a&&w)setStatus('Force arm timed out — press Disarmed to re-arm');
@@ -2174,6 +2349,7 @@ function forceJoin(dev,key,val){
       if(d.ok){
         if(j&&!d.pulsed){j.v=d.v;delete j.ferr;}
         renderWatch();
+        pollSignals();
       }else if(j){
         j.ferr=d.error||'rejected';
         renderWatch();
@@ -2199,6 +2375,26 @@ function escAttr(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,'\\\'').
 // plain HTML-attribute escaping (value="", title="") — escAttr is ONLY for JS strings inside handlers
 function escq(s){return esc(String(s)).replace(/""/g,'&quot;');}
 function saveWatch(){try{localStorage.setItem('dbg-watchlist',JSON.stringify(watchList));}catch(x){}}
+// Tracing writes a log line on every change of a signal, so a join can be followed without
+// adding anything to the program. The traced set is asserted to the processor on every poll
+// (see pollSignals), so it stops by itself if this page goes away.
+function traceBtnHtml(e){
+  var tip=e.trace?'Logging every change of this signal. Click to stop.'
+                 :'Log every change of this signal, without adding anything to the program.';
+  return '<button class=""wt'+(e.trace?' on':'')+'"" title=""'+tip+'"" onclick=""toggleTrace('+
+         jsq(e.dev)+','+jsq(e.key)+')"">Log</button>';
+}
+function jsq(v){return ""'""+escAttr(v)+""'"";}
+function toggleTrace(dev,key){
+  for(var i=0;i<watchList.length;i++){
+    var e=watchList[i];
+    if(e.dev===dev&&e.key===key){
+      if(e.trace)delete e.trace;else e.trace=true;
+      saveWatch();renderWatch();pollSignals();
+      return;
+    }
+  }
+}
 // UI direction convention (system-centric, per user preference): ""Out"" = the program's
 // output TO the panel (API InputSig — text/feedback, forceable); ""In"" = coming in FROM
 // the panel (API OutputSig — presses, read-only). The wire keys keep the API's 'o' prefix.
@@ -2243,7 +2439,7 @@ function addWatch(){
   saveWatch();
   joinRev=0;               // watch set changed: next poll fetches everything
   renderWatch();
-  refresh();
+  pollSignals();
 }
 function renameWatch(dev,key){
   for(var i=0;i<watchList.length;i++){
@@ -2274,7 +2470,9 @@ function toggleWatch(){
     loadDevices();
     joinRev=0;             // fresh open: fetch every watched value
     renderWatch();
-    refresh();
+    startSignals();
+  }else{
+    stopSignals();
   }
 }
 var splitDrag=false;
@@ -2329,6 +2527,7 @@ function refresh(){
   var tasks=[fetch('api/logs?since='+lastSeq).then(function(r){return r.json();}).then(function(d){
     if(d.entries&&d.entries.length){
       needRender=true;
+      lastActivity=Date.now();             // new log entries mean the system is busy
       debuggerEntries=debuggerEntries.concat(d.entries);
       // bound client memory to the server ring size; the server already bounds what it sends
       if(debuggerEntries.length>CLIENT_MAX) debuggerEntries=debuggerEntries.slice(debuggerEntries.length-CLIENT_MAX);
@@ -2343,47 +2542,6 @@ function refresh(){
     if(JSON.stringify(next)!==JSON.stringify(processorEntries)) needRender=true;
     processorEntries=next;
   }));
-  if(watchOpen&&watchList.length){
-    // one fetch per watched device (usually one); the ?since cursor means an unchanged
-    // watch set with unchanged values costs a ~40-byte response
-    var byDev={};
-    watchList.forEach(function(e){
-      var arr=(byDev[e.dev]=byDev[e.dev]||[]);
-      arr.push(e.key);
-      if(e.pair)arr.push(oKey(e.key));   // paired rows watch both directions of the join
-    });
-    Object.keys(byDev).forEach(function(dev){
-      tasks.push(fetch('api/joins?since='+joinRev+'&dev='+encodeURIComponent(dev)+'&w='+encodeURIComponent(byDev[dev].join(','))).then(function(r){return r.json();}).then(function(d){
-        if(d.joins&&d.joins.length){
-          var flashed=false;
-          d.joins.forEach(function(j){
-            var id=dev+'|'+j.k;
-            var old=joinVals[id];
-            // chg counts every transition server-side (press AND release both fire); the UI
-            // shows it as a 1s activity lamp rather than a number
-            if(j.chg&&(!old||j.chg>(old.chg||0))){wflash[id]=Date.now()+1000;flashed=true;}
-            joinVals[id]=j;
-            // If this row's value changed WHILE its editor is focused, the live change wins:
-            // overwrite the box in place (renders are blocked during edits, so without this
-            // the box goes stale and Enter would force an outdated value back over a fresh
-            // panel change, e.g. a slider move).
-            if(id===editingWatch&&old&&!j.err&&String(old.v)!==String(j.v)){
-              var ae=document.activeElement;
-              if(ae&&(ae.className.indexOf('wnum')>=0||ae.className.indexOf('wtxt')>=0)){
-                ae.value=j.v;
-                ae.classList.remove('dirty');
-              }
-            }
-          });
-          needRender=true;
-          if(flashed)setTimeout(function(){renderWatch();},1100);   // turn the lamp back off
-        }
-        if(typeof d.lastRev==='number'&&d.lastRev>joinRev) joinRev=d.lastRev;
-        if(typeof d.armed==='boolean') syncArm(d.armed,d.writesAllowed!==false);
-        if(typeof d.online==='boolean') setDevOnline(dev,d.online);
-      }));
-    });
-  }
   Promise.all(tasks).then(function(){
     if(needRender){applyFilter();needRender=false;}
     var note=LOGGING_ENABLED?'':'  — LOGGING OFF';
@@ -2440,19 +2598,56 @@ function toggleTheme(){
   document.getElementById('themeBtn').textContent=light?'Dark Mode':'Light Mode';
   try{localStorage.setItem('dbg-theme',light?'light':'dark');}catch(x){}
 }
+// ── When this page polls ─────────────────────────────────────────────────────
+// Three separate things are easily confused, so to be explicit: the Logging button is a
+// RECORDING switch on the processor and has nothing to do with this page's requests; Pause
+// is a manual stop of this page's requests; and the rules below stop them on their own so a
+// forgotten tab cannot poll a processor for days.
+//
+// Polling stops while the tab is hidden (nobody can read it anyway) and after
+// IDLE_SUSPEND_MS in which neither the user touched the page nor any value arrived. Received
+// changes count as activity, so watching a panel being pressed — which involves no browser
+// input at all — never suspends. It resumes on a click, a keystroke, or the tab being shown.
+var IDLE_SUSPEND_MS=900000;                     // 15 minutes
+var lastActivity=Date.now(), suspended=false, suspendReason='';
+function pollingWanted(){return !paused&&!suspended;}
+function applyPolling(){
+  if(pollingWanted()){
+    if(!pollTimer){pollTimer=setInterval(refresh,2000);refresh();}
+    if(watchOpen&&!signalTimer)startSignals();
+  }else{
+    if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+    stopSignals();
+  }
+}
+function noteActivity(){
+  lastActivity=Date.now();
+  if(suspended&&suspendReason==='idle')resumePolling();
+}
+function suspendPolling(reason){
+  if(suspended||paused)return;
+  suspended=true;suspendReason=reason;
+  applyPolling();
+  if(reason==='idle')setStatus('Idle — updates stopped. Click the page to resume.');
+}
+function resumePolling(){
+  if(!suspended)return;
+  suspended=false;suspendReason='';lastActivity=Date.now();
+  applyPolling();
+}
 function togglePause(){
-  // Client-side only: stops polling/rendering. The server keeps recording while paused, so
+  // Manual stop of this page's requests. The processor keeps recording while paused, so
   // resuming fetches everything logged during the freeze (subject to the server ring cap).
   paused=!paused;
   var b=document.getElementById('pauseBtn');
   b.textContent=paused?'Resume':'Pause';
   b.classList.toggle('on',paused);
   if(paused){
-    if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
-    document.getElementById('status').textContent='Paused — recording continues';
+    applyPolling();
+    setStatus('Paused — page not updating; the processor keeps recording');
   }else{
-    refresh();
-    pollTimer=setInterval(refresh,2000);
+    suspended=false;suspendReason='';lastActivity=Date.now();
+    applyPolling();
   }
 }
 function toggleLogging(){
@@ -2497,6 +2692,7 @@ function toggleLogging(){
         document.getElementById('wsplit').style.display='';
         document.getElementById('watchBtn').classList.add('on');
         loadDevices();
+        startSignals();
       }
     }catch(x){}
   }
@@ -2510,8 +2706,18 @@ function toggleLogging(){
   });
 })();
 applyFilter();   // initial paint (shows ""No entries."" until the first poll lands)
-refresh();
-pollTimer=setInterval(refresh,2000);
+setInterval(function(){
+  if(!pollingWanted())return;
+  if(Date.now()-lastActivity>IDLE_SUSPEND_MS)suspendPolling('idle');
+},30000);
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden)suspendPolling('hidden');
+  else if(suspendReason==='hidden')resumePolling();
+});
+document.addEventListener('mousedown',noteActivity);
+document.addEventListener('keydown',noteActivity);
+document.addEventListener('wheel',noteActivity);
+applyPolling();
 </script>
 </body>
 </html>";
