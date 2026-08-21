@@ -3,6 +3,19 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.1] - 2026-08-21
+
+### Fixed
+- A contract device's signal picker no longer offers joins the manifest doesn't declare a
+  name for. Those were shown with CH5's own generic placeholder ("Bool Sig Number 7"),
+  which read as a mismatch against the same smart object's other direction when that one
+  has a real contract name (e.g. a Dpad's Out picker offering "Up", "Down"... while its In
+  picker offered a meaningless placeholder for an unrelated, undeclared join). Manual
+  Join# entry still reaches anything the picker now leaves out. SGD-loaded devices are
+  unaffected — their SDK name is already meaningful, not a placeholder.
+- The PDF documentation no longer carries a browser-print header (title/date) and footer
+  (source file path) on every page.
+
 ## [1.5.0] - 2026-08-20
 
 ### Added

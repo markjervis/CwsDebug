@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.5.0
+//  Version:  1.5.1
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -213,7 +213,7 @@ namespace CwsDebug
         // the page's own version string proves exactly which build is on the processor. A
         // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
         // release time, same as every other version-bump-in-3-places step.
-        private const string Version = "1.5.0";
+        private const string Version = "1.5.1";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -3453,7 +3453,17 @@ function fillSigOptions(d){
     // don't support by-name sig lookup at all, so a name-addressed key on one of them is a
     // permanent resolution error no matter how it's spelled. Numbers work identically for
     // both, so there is no reason to ever depend on name-lookup succeeding.
-    list=(dir===''?ins:outs).filter(function(s){return s.name;})
+    //
+    // For a contract device, s.name is CH5's own generic placeholder (""Bool Sig Number 7"") on
+    // any join the manifest doesn't declare — the contract has no state/event for it at all, so
+    // there is nothing real to show. Listing it anyway reads as a mismatch against the SAME SO's
+    // other direction, which usually does have a real contract name (e.g. Out shows ""Up"" while
+    // In shows ""Bool Sig Number 7"" for a join that isn't ""Up""'s counterpart, just an unrelated
+    // undeclared one on the same object) — so a contract device only offers joins that have a
+    // genuine contract-derived friendly name. Manual entry via the Join# box still reaches any
+    // join the picker leaves out. An SGD-loaded device keeps the old behavior: its s.name is the
+    // SDK's own name as configured in SIMPL, already meaningful, not a placeholder.
+    list=(dir===''?ins:outs).filter(function(s){return d.contract?s.friendly:s.name;})
       .map(function(s){return {v:String(s.n),t:disp(s)+' ('+s.n+')'};});
   }
   sel.innerHTML='';
