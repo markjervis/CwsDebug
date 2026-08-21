@@ -22,10 +22,14 @@ files to deploy. It builds as a **Program Library** and is referenced by your SI
 - **Pause** control on the page (recording continues on the processor while paused).
 - **Millisecond timestamps** and incremental polling (only new entries are fetched).
 - **Processor error log** view on hardware appliances (read via the console `err` command).
-- **Signals panel** — register a touchpanel with one line and view or force its joins live from
-  the page, Toolbox-style: digital (high / low / pulse), analog and serial, plus Smart Graphics
-  object signals picked by their SGD names. Forcing sits behind an arm switch and every force is
-  recorded in the log.
+- **Signals panel** — register a touchpanel with one line and view or change its signals live
+  from the page, Toolbox-style: digital (low / pulse / high), analog and serial, plus smart-object
+  signals picked by name. Changes sit behind an arm switch and every one is recorded in the log.
+- **Drive either direction** — send a value *into* the panel to change what it shows, or drive a
+  signal *out of* it to make the program react exactly as if the panel had been used, so a control
+  on the page can exercise the code behind a control on the panel.
+- **Crestron Construct / CH5 contracts** — register a panel with its contract and address signals
+  by their contract item path, with smart objects and their signals listed by contract name.
 - **Signal logging** — switch on `Log` for any signal in the panel and every change of it is
   written to the log, without adding anything to the program.
 
@@ -101,19 +105,20 @@ All members are `static` on `CwsDebugPage`.
 | `MinLevel` *(property)*             | Minimum severity recorded (`DebugLevel`: Info, Notice, Warning, Error, Fatal). Defaults to Info. |
 | `LoggingEnabled` *(property)*       | Master record switch. Persisted across restarts. Defaults to `true`.                             |
 | `Dispose()` / `Shutdown()`          | Stops the server, flushes the log, releases resources. Idempotent and optional.                  |
-| `RegisterDevice(name, device)`      | Exposes a device's joins in the Signals panel. Any `BasicTriList` (XPanel, TSW, …).              |
+| `RegisterDevice(name, device, sgdPath?)` | Exposes a device's joins in the Signals panel. Any `BasicTriList` (XPanel, TSW, …). Pass the SGD path to label smart objects with their design-time names. |
+| `RegisterContract(name, device, cse2jPath)` | As `RegisterDevice`, plus a Crestron Construct contract so signals can be addressed by contract item path. |
 | `UnregisterDevice(name)`            | Drops a device. Call before disposing it.                                                        |
 | `UnregisterAllDevices()`            | Drops every registered device.                                                                   |
-| `ValueWritesAllowed` *(property)*   | Master switch for forcing. `false` leaves the panel read-only. Defaults to `true`.               |
-| `ValueWritesArmed` *(property)*     | Arm gate for forcing. Defaults to `false` at every program start; never persisted.               |
-| `ValueArmTimeoutMs` *(property)*    | Idle timeout before forcing disarms itself. Defaults to 300000 (5 min); `<= 0` disables it.      |
+| `ValueWritesAllowed` *(property)*   | Master switch for changing signals. `false` leaves the panel read-only. Defaults to `true`.     |
+| `ValueWritesArmed` *(property)*     | Arm gate for changing signals. Defaults to `false` at every program start; never persisted.     |
+| `ValueArmTimeoutMs` *(property)*    | Idle timeout before the arm gate closes itself. Defaults to 300000 (5 min); `<= 0` disables it. |
 
 Each `Log*` method accepts an optional `string.Format` template plus arguments, e.g.
 `CwsDebugPage.LogInfo("Connected to {0}:{1}", host, port);`
 
 ## Signals panel
 
-Register a device once, and its joins become browsable and forceable from the page:
+Register a device once, and its signals become browsable and drivable from the page:
 
 ```csharp
 public override void InitializeSystem()
@@ -134,20 +139,53 @@ panel.Dispose();
 Open **Signals** on the page and add a signal by device, type (Digital / Analog / Serial) and
 direction:
 
-- **Out** — the program's value going *to* the panel: button feedback, gauge levels, indirect
-  text. This is the side that can be forced.
-- **In** — what the panel sends *back*: presses and slider moves. Read-only, since a panel's
-  output signals cannot be written.
+- **In** — signals going *into* the panel: button feedback, gauge levels, indirect text. Driving
+  these changes what the panel **shows**.
+- **Out** — signals coming *out of* the panel: presses and slider moves. Driving these makes the
+  program react exactly as if the panel had been used, so it changes what the system **does**.
 - **Both** — one row showing a join's two directions together.
 
-Enter a **Smart Object ID** to reach a Smart Graphics object, and its signals are listed by their
-SGD names (`Item 1 Pressed`, `Select Item`, `Item 1 Text`) rather than by number. Rows can be
-given friendly names, and the list is remembered in the browser.
+Both directions are driven the same way, with **Pulse**, **High** and **Low** — the difference is
+what a change reaches, not how you make it.
 
-Digital rows show the signal's state and light a lamp while it is high, with force buttons for
-**High**, **Low** and **Pulse**; analog and serial rows are edited by typing a value and pressing
-Enter. Forcing writes to the join itself — unlike Toolbox there is no separate "unforce", so the
+Enter a **Smart Object ID** to reach a smart object, and its signals are listed by name
+(`Item 1 Pressed`, `Select Item`, `Item 1 Text`) rather than by number. The field offers the
+objects it knows about, so you can type a number or part of a name. Rows can be given friendly
+names, and the list is remembered in the browser.
+
+To have smart objects labelled with their design-time names, pass the SGD file you already give
+`LoadSmartObjects`:
+
+```csharp
+tsPanel.LoadSmartObjects(sgdPath);
+CwsDebugPage.RegisterDevice("Panel", tsPanel, sgdPath);   // objects show as "Button List", etc.
+```
+
+### Crestron Construct / CH5 panels
+
+Register the panel with its contract, and its signals can additionally be addressed by contract
+item path. Smart objects and their signals are then listed by contract name — `Main.Dpad` with
+`Up`, `Down`, `Left`, `Right`, `Center` — rather than by number:
+
+```csharp
+CwsDebugPage.RegisterContract("Touchpanel", ch5Panel, "My Project.cse2j");
+```
+
+The manifest is the `<Project>.cse2j` file from the Construct project's
+`output\contract\mapping\` folder, and the program must ship it as content so it exists on the
+processor (a `CopyToOutputDirectory` entry in the `.csproj`). If it is missing or unreadable the
+panel still registers and everything remains reachable by number — a warning in the log says so,
+rather than failing quietly.
+
+Digital rows show the signal's state and light a lamp while it is high, with buttons for
+**Pulse**, **High** and **Low**; analog and serial rows are edited by typing a value and pressing
+Enter. Values are written to the join itself — unlike Toolbox there is no separate "unforce", so a
 value stands until the program or the panel changes it again.
+
+On an **Out** row those same buttons simulate panel activity: the program's own logic runs just as
+it would from a real press, so a button on the page can exercise the code behind a button on the
+panel — no changes to your program required. Where that is unavailable, the buttons simply do not
+appear and the row stays a live read-out.
 
 Each row also has a **Log** toggle. With it on, the processor writes a line to the log every time
 that signal changes:
@@ -195,12 +233,6 @@ keyboard use; it resumes on a click, a keystroke, or the tab being shown.
 - **Processor error log:** read via the console `err` command and shown only on a hardware
   appliance; hidden on VC-4, where no per-program console error log exists.
 
-## Roadmap
-
-- **Crestron Construct Contracts** *(planned)* — support for panels built with Crestron
-  Construct, addressing signals through the project's Contract definitions the same way
-  Smart Graphics signals are addressed through the SGD today.
-
 ## A note on network access
 
 The debug page has no login. Anyone who can reach the processor on the network can open the
@@ -211,12 +243,12 @@ visible to everyone on that network — so avoid logging passwords, door codes, 
 sensitive, and ask your IT/network administrator to place the processor on a restricted VLAN
 if that's a concern.
 
-The same applies to the Signals panel, which can change values on a running system. Forcing is
-switched off until someone arms it, arming is forgotten whenever the program restarts or the
-page is reloaded, it switches itself back off after five idle minutes, and every force is
-written to the log with the address of the machine that sent it. For a system being handed over,
-set `CwsDebugPage.ValueWritesAllowed = false` to leave the panel read-only while keeping the
-live view.
+The same applies to the Signals panel, which can change values on a running system — and, on an
+**Out** row, make the program act as though the panel had been used. Both are switched off until
+someone arms them, arming is forgotten whenever the program restarts or the page is reloaded, it
+switches itself back off after five idle minutes, and every change is written to the log with the
+address of the machine that sent it. For a system being handed over, set
+`CwsDebugPage.ValueWritesAllowed = false` to leave the panel read-only while keeping the live view.
 
 ## Building
 

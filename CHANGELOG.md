@@ -3,6 +3,70 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.0] - 2026-08-20
+
+### Added
+- **Crestron Construct / CH5 contracts** — `CwsDebugPage.RegisterContract(name, device, cse2jPath)`
+  registers a panel and loads its Construct contract, so its signals can be addressed by their
+  contract item path (`c~Main.B1.Press`) as well as by join number. The manifest is the project's
+  own `<Project>.cse2j`, which the host program ships as content. If it is missing or unreadable
+  the device still registers and numeric addressing still works — a warning says so rather than
+  failing silently.
+- **Named smart objects.** Smart-object numbers are labelled with the object's own name, taken
+  from the SGD for a Smart Graphics panel (`Button List`, `Simple Keypad`) or from the contract for
+  a Construct panel (`Main.Dpad`, `Main.HButtonList`). `RegisterDevice` takes an optional `sgdPath`
+  to supply the SGD; without it, numbers are still listed, just unlabelled. The SO field offers the
+  known objects as a searchable list — type a number or part of a name.
+- **Named signals inside a smart object.** Contract-backed objects list their signals by contract
+  name (`Left`, `Button3.ButtonPress`) instead of the generic `Bool Sig Number 5`.
+- **Paired rows for contract items.** A contract's press and its selected-state can be shown as one
+  row even though they sit on different joins.
+- **Driving the Out direction.** The **Pulse / High / Low** controls now work on Out signals too.
+  Driving one makes the program react exactly as if the panel had been used — its own signal
+  handlers and Construct contract events run — so a control on the page can exercise the code behind
+  a control on the panel, with no changes to the program. Subject to the same arm gate, kill switch
+  and audit trail as the In direction. Where it is unavailable the controls do not appear and the row
+  stays a live read-out.
+- The **Log** toggle is on by default for a newly added signal.
+- Clicking the clock in the page header switches between 12- and 24-hour time.
+
+### Changed
+- **Signal directions are now named from the panel's point of view, matching Crestron's own
+  naming: `In` goes *into* the panel (feedback, text — changes what the panel shows) and `Out`
+  comes *out of* it (presses — changes what the system does).** This is the reverse of 1.4.0, so a
+  saved row may now show the opposite label; the signal it refers to has not changed. The signal
+  keys were already API-aligned (`od5` is an Out signal) and are unchanged.
+- Both directions are driven the same way, with **Low**, **Pulse** and **High**.
+- The direction selector comes after the smart-object field, since which directions are available
+  depends on the object chosen.
+- The Signals button appears only while at least one device is registered, and follows
+  registration while the page is open.
+- Signals are polled with a request body rather than a query string, so a long list of logged
+  signals cannot outgrow the request.
+
+### Fixed
+- A signal row is identified by the row itself, so renaming, un-logging or removing one row no
+  longer affects another that happens to share a join.
+- Adding a second valid paired row that shares one of its joins is no longer silently ignored.
+- A signal that could not be resolved when it was first requested is retried, so a row added
+  before the program finished starting recovers instead of showing an error for good.
+- A contract's smart-object names are no longer left blank when the project has a page-level
+  signal with no dotted path.
+- One malformed entry in a contract manifest no longer discards the whole contract.
+- Duplicate item paths in a manifest keep their first declaration and are reported, rather than
+  silently changing a signal's direction.
+- Reaching a device by a differently-cased name no longer writes duplicate log lines for the same
+  change.
+- The persisted log keeps a recoverable copy on disk throughout a flush, so power loss during a
+  write cannot lose the history.
+- Requests are bounded and guarded: a capped watch list and key length, a hard cap on cached
+  resolutions, and a top-level guard so a browser closing mid-request cannot surface an error.
+- Signal-change subscriptions are attached and detached outside the library's own lock, removing a
+  potential stall when a busy panel is re-registered.
+- Log lines and error replies are never written while the device lock is held.
+- The force arm timer is read atomically, so it cannot mis-expire on a 32-bit processor.
+- Reading a Smart Graphics file is bounded and streamed rather than buffered whole.
+
 ## [1.4.0] - 2026-08-12
 
 ### Added

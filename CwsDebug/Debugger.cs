@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.4.0
+//  Version:  1.5.0
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -15,6 +15,7 @@
 using System.Reflection;            // Assembly.GetCallingAssembly() — host program name
 using System.Runtime.CompilerServices; // [MethodImpl(NoInlining)] — keeps GetCallingAssembly honest
 using System.Text;                  // StringBuilder for JSON responses
+using System.Text.Json;             // reading a Construct .cse2j contract manifest
 using System.Text.RegularExpressions; // parsing the console "err" output
 using Crestron.SimplSharp;          // CrestronEnvironment, ErrorLog, InitialParametersClass, CTimer
 using Crestron.SimplSharp.WebScripting; // HttpCwsServer / IHttpCwsHandler (CWS hosting)
@@ -93,6 +94,7 @@ namespace CwsDebug
         private long      _seq;                             // last sequence id handed out (see LogEntry.Seq)
         private bool      _dirty;                            // _log changed since the last successful disk flush
         private string?   _persistPath;                      // file the log is mirrored to; null until Register()
+        private int       _flushing;                         // 0/1 guard: one FlushToDisk at a time (see FlushToDisk)
         private string?   _statePath;                        // file storing the _loggingEnabled flag
         private CTimer?   _flushTimer;                        // periodic disk-flush timer; null until Register()
         private bool      _loggingEnabled = true;            // master record switch; persisted across restarts
@@ -101,13 +103,21 @@ namespace CwsDebug
 
         // ── Device join watch (Phase 1: read-only) ─────────────────────────────────────
         // Registered devices, addressed by joins from the page (Toolbox-style) — see the
-        // "Device join watch" region below. _devLock guards both dictionaries; no host code
-        // is ever invoked under it (sig reads are plain field reads, not callbacks).
+        // "Device join watch" region below. _devLock guards these dictionaries.
         //
-        // LOCK ORDERING INVARIANT: _devLock may be held when taking _lock (AppendAudit is
-        // called from join paths), but code holding _lock must NEVER take _devLock — that
-        // inversion would deadlock. _lock-holding code (Append/flush/serve-logs) currently
-        // never touches device state; keep it that way.
+        // LOCK ORDERING INVARIANT: code holding _lock must NEVER take _devLock — that inversion
+        // would deadlock. _lock-holding code (Append/flush/serve-logs) never touches device
+        // state; keep it that way. The reverse direction is avoided too: the join paths build
+        // their log lines and error replies while holding _devLock but EMIT them after releasing
+        // it (see MarkSigActivity, ServeJoins, WriteJoin), so in practice the two locks are never
+        // held at once in either order.
+        //
+        // Related, and easy to get wrong: do not call into the SDK's event accessors
+        // (SigChange +=/-=) while holding _devLock. The SDK holds its own event lock while
+        // dispatching to handlers, and those handlers call MarkSigActivity, which takes _devLock —
+        // so subscribing under _devLock takes the pair in the opposite order from the dispatch
+        // path. Register/unregister therefore queue that work and run it after the lock is
+        // released (see UnhookLocked / RunDeferred).
         //
         // Known, accepted costs: MarkSigActivity scans _joinCache (<= JoinCacheMax entries)
         // under _devLock on every sig event of a registered device — bounded but a hot spot
@@ -122,7 +132,39 @@ namespace CwsDebug
         private readonly Dictionary<string, WatchSlot> _joinCache = new(StringComparer.Ordinal); // "dev|key" -> resolved sig
         private long _joinRev;                              // bumped when any watched join's rendered value changes
 
+        // Driving the Out direction (out of the panel) resolves one SDK method per output-sig
+        // collection type and caches it here; a null cached value means that type could not be
+        // resolved on this SDK build, so those controls hide themselves rather than throwing.
+        // Guarded by _injectGate. See the Out-direction region for the full rationale.
+        private readonly object _injectGate = new();
+        private readonly Dictionary<Type, System.Reflection.MethodInfo?> _injectMethods = new();
+        private System.Reflection.MethodInfo? _serialInject;   // the 4-arg string overload, resolved by scan
+        private object? _serialEnc, _serialMode;               // boxed enum args for the serial overload
+        private bool _serialProbed;
+
+        // Construct/CH5 contract support: a device registered via RegisterContract additionally
+        // gets an entry here, mapping the manifest's dotted item paths to the underlying smart-
+        // object join. Guarded by _devLock, same as _devices. Never populated for a plain
+        // RegisterDevice() call, so "c~" keys simply fail to resolve against such a device.
+        private readonly Dictionary<string, Dictionary<string, ContractItem>> _contracts = new(StringComparer.OrdinalIgnoreCase);
+
+        // Smart-object ID -> friendly label, per device. Purely a display aid for the Add-bar
+        // (so "SO 8" can show as "SO 8 (Main.Dpad)") — never consulted by ResolveKey, so a
+        // wrong or missing label can never misdirect a watch/force the way item-pairing could.
+        // Populated from whichever source is available: a Construct contract's manifest
+        // (derived, not authored — see DeriveContractSoNames) or an SGD's own Hint= fields
+        // (see ParseSgdSmartObjectNames). Either, both, or neither may be present for a device.
+        private readonly Dictionary<string, Dictionary<uint, string>> _soNames = new(StringComparer.OrdinalIgnoreCase);
+
+        // Per-signal friendly names, contract devices only — device name -> SigNameKey() -> leaf
+        // name (see DeriveContractNames). Same "display only, never consulted by ResolveKey"
+        // guarantee as _soNames.
+        private readonly Dictionary<string, Dictionary<string, string>> _sigNames = new(StringComparer.OrdinalIgnoreCase);
+
         private const int MaxWatchKeys      = 128;          // per-request cap; the watch set is client-supplied
+        private const int MaxKeyLen         = 256;          // per-key cap; keys become cache dictionary keys
+        private const int MaxBodyLen        = 131072;       // api/joins POST body cap (128 KB)
+        private const int ErrorRetryMs      = 5000;         // how often an errored watch key is re-resolved
         private const int JoinCacheMax      = 512;          // resolution-cache bound
         private const int JoinCacheEvictMs  = 300000;       // entries idle this long are evicted (5 min)
         private const int TraceTtlMs        = 15000;        // tracing lapses this long after the page last asked
@@ -138,6 +180,10 @@ namespace CwsDebug
         private volatile bool _writesAllowed = true;         // host kill switch (production: set false)
         private volatile bool _armed;                        // arm gate; lazy idle-disarm, no timer
         private int  _armTimeoutMs = 300000;                 // <= 0 disables auto-disarm
+        // Written from CWS request threads and read by the idle check. Accessed only through
+        // Interlocked/Volatile: a plain long is NOT guaranteed atomic on a 32-bit runtime (the
+        // 4-Series ARM target), and a torn read here would either disarm mid-session or fail to
+        // disarm when it should — both bad for something whose whole job is a safety timeout.
         private long _lastArmActivityMs;                     // last arm/force, for the idle check
         private long _forceWinMs;                            // rate-limit window start
         private int  _forceCount;                            // accepted forces in the window
@@ -163,7 +209,11 @@ namespace CwsDebug
         private const string DefaultBasePath = "/debugger";
 
         // Library version, shown in the page header. Keep in step with the .csproj <Version>.
-        private const string Version = "1.4.0";
+        // Dev builds carry a 4th number that bumps on every rebuild (1.4.0.1, 1.4.0.16, ...) so
+        // the page's own version string proves exactly which build is on the processor. A
+        // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
+        // release time, same as every other version-bump-in-3-places step.
+        private const string Version = "1.5.0";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -425,9 +475,17 @@ namespace CwsDebug
         /// device. Safe from any thread and before Register(). The library holds a strong
         /// reference until UnregisterDevice()/program stop — call UnregisterDevice() before
         /// disposing the device.
+        ///
+        /// <paramref name="sgdPath"/> is optional: pass the same .sgd file given to
+        /// LoadSmartObjects() and each smart object's design-time name (VT Pro-e's "Hint",
+        /// e.g. "Button List" for Smart Object ID=1) is shown next to its number in the
+        /// Add-bar, instead of the number alone. Purely a display aid — resolution is still
+        /// by number underneath, so a name that can't be parsed just leaves the number
+        /// unlabeled rather than blocking registration. May be relative (resolves against the
+        /// application directory) or omitted entirely.
         /// </summary>
-        public static void RegisterDevice(string name, BasicTriList device)
-            => Instance.RegisterDeviceInternal(name, device);
+        public static void RegisterDevice(string name, BasicTriList device, string? sgdPath = null)
+            => Instance.RegisterDeviceInternal(name, device, sgdPath);
 
         /// <summary>Drops a registered device. Call before disposing it. Returns false if the name was not registered.</summary>
         public static bool UnregisterDevice(string name)
@@ -436,6 +494,25 @@ namespace CwsDebug
         /// <summary>Drops every registered device.</summary>
         public static void UnregisterAllDevices()
             => _instance?.UnregisterAllDevicesInternal();
+
+        /// <summary>
+        /// Like <see cref="RegisterDevice"/>, but also loads a Crestron Construct contract
+        /// manifest (the "&lt;Project&gt;.cse2j" file under a Construct project's
+        /// "output\contract\mapping\" folder) so the device's joins can additionally be
+        /// addressed by their Construct item path (e.g. "Main.B1.Press") instead of only by
+        /// raw join number. The host program must ship the .cse2j as content so it exists on
+        /// the processor (e.g. a Content/CopyToOutputDirectory entry in the .csproj) — this is
+        /// a build artifact of the Construct project, not something SIMPL#Pro copies for you.
+        /// <paramref name="cse2jPath"/> may be relative, in which case it resolves against the
+        /// application directory.
+        ///
+        /// If the manifest is missing or unparseable, the device still registers exactly as
+        /// RegisterDevice would (numeric/SO addressing keeps working) — only contract-name
+        /// addressing is unavailable, and a Warning is written to the log so this is never a
+        /// silent failure. Undo with the existing UnregisterDevice(name).
+        /// </summary>
+        public static void RegisterContract(string name, BasicTriListWithSmartObject device, string cse2jPath)
+            => Instance.RegisterContractInternal(name, device, cse2jPath);
 
         /// <summary>
         /// Host kill switch for forcing. False makes every watched join read-only regardless
@@ -455,7 +532,7 @@ namespace CwsDebug
         public static bool ValueWritesArmed
         {
             get { var i = Instance; i.CheckArmIdle(); return i._armed; }
-            set { var i = Instance; i._armed = value; i._lastArmActivityMs = Environment.TickCount64; }
+            set { var i = Instance; i._armed = value; System.Threading.Interlocked.Exchange(ref i._lastArmActivityMs, Environment.TickCount64); }
         }
 
         /// <summary>Idle timeout for the arm gate, in ms. Default 300000 (5 min). &lt;= 0 disables auto-disarm.</summary>
@@ -472,7 +549,7 @@ namespace CwsDebug
         private void CheckArmIdle()
         {
             if (_armed && _armTimeoutMs > 0 &&
-                Environment.TickCount64 - _lastArmActivityMs > _armTimeoutMs)
+                Environment.TickCount64 - System.Threading.Interlocked.Read(ref _lastArmActivityMs) > _armTimeoutMs)
             {
                 _armed = false;
                 AppendAudit("Notice", "Force arm timed out (idle)");
@@ -536,7 +613,7 @@ namespace CwsDebug
             // Any force ATTEMPT proves a human is at the page, so it refreshes the arm
             // window before the gates run — a rejected attempt (bad value, read-only join)
             // must not let the timeout expire under an actively-working user.
-            _lastArmActivityMs = Environment.TickCount64;
+            System.Threading.Interlocked.Exchange(ref _lastArmActivityMs, Environment.TickCount64);
 
             if (!_writesAllowed)
             { WriteForceError(context, 403, "writes disabled by host", devName, k, v); return; }
@@ -545,39 +622,49 @@ namespace CwsDebug
             { WriteForceError(context, 403, "writes not armed", devName, k, v); return; }
 
             // Rate limit: forces are CIP traffic to a real panel on an unauthenticated endpoint.
+            // NOTE on the two blocks below: every WriteForceError is emitted AFTER the lock is
+            // released, never inside it. WriteForceError -> AppendAudit takes _lock, and this
+            // file's ordering invariant is one-way (a thread may take _lock holding nothing, but
+            // must never take _devLock while holding _lock). Emitting from inside _devLock would
+            // invert that, and would also hold the device lock across a socket write — stalling
+            // the sig-dispatch thread for the duration of every rejected force.
             long nowMs = Environment.TickCount64;
+            bool rateLimited;
             lock (_devLock)
             {
                 if (nowMs - _forceWinMs >= 1000) { _forceWinMs = nowMs; _forceCount = 0; }
-                if (++_forceCount > MaxForcesPerSecond)
-                { WriteForceError(context, 429, "rate limited", devName, k, v); return; }
+                rateLimited = ++_forceCount > MaxForcesPerSecond;
             }
+            if (rateLimited)
+            { WriteForceError(context, 429, "rate limited", devName, k, v); return; }
 
             // Resolve the key (shared cache with the watch path).
-            WatchSlot slot;
+            WatchSlot? slot = null;
             lock (_devLock)
             {
-                BasicTriList? device = null;
-                if (!string.IsNullOrEmpty(devName)) _devices.TryGetValue(devName, out device);
-                else if (_devices.Count == 1) foreach (var kv in _devices) { devName = kv.Key; device = kv.Value; }
-                if (device == null)
-                { WriteForceError(context, 404, "unknown device", devName, k, v); return; }
-
-                var cacheKey = devName + "|" + k;
-                if (!_joinCache.TryGetValue(cacheKey, out slot!))
+                if (TryResolveDeviceLocked(devName, out var canonName, out var device) && device != null)
                 {
-                    slot = ResolveKey(device, k);
-                    _joinCache[cacheKey] = slot;
+                    devName = canonName;                  // cache under the REGISTERED spelling
+                    var cacheKey = devName + "|" + k;
+                    if (!_joinCache.TryGetValue(cacheKey, out slot!))
+                    {
+                        _contracts.TryGetValue(devName, out var cmap);
+                        slot = ResolveKey(device, k, cmap);
+                        slot.ResolvedMs = nowMs;
+                        _joinCache[cacheKey] = slot;
+                    }
+                    slot.LastSeenMs = nowMs;
                 }
-                slot.LastSeenMs = nowMs;
             }
+            if (slot == null)
+            { WriteForceError(context, 404, "unknown device", devName, k, v); return; }
 
             if (slot.Error != null)
             { WriteForceError(context, 400, slot.Error, devName, k, v); return; }
             if (slot.ReadOnly)
             { WriteForceError(context, 403, "read-only (output sigs cannot be forced)", devName, k, v); return; }
 
-            _lastArmActivityMs = nowMs;                       // any accepted attempt refreshes the arm window
+            System.Threading.Interlocked.Exchange(ref _lastArmActivityMs, nowMs);   // any accepted attempt refreshes the arm window
 
             // Type-specific parse + write. The sig write itself runs no host code (it drives
             // the device over CIP), so no lock is held around it.
@@ -684,6 +771,269 @@ namespace CwsDebug
             context.Response.Write("{\"ok\":false,\"error\":" + JsonString(message) + "}", true);
         }
 
+        // ── Driving the Out direction (out of the panel) ──────────────────────────────────
+        // api/join (above) drives the In direction, INTO the panel: an input sig, which changes
+        // what the panel SHOWS. This drives the Out direction, OUT OF the panel: an output sig,
+        // which changes what the system DOES — it updates the sig AND raises the device's change
+        // event, so the program's own SigChange handlers, and Construct contract events (which sit
+        // on that same event), run exactly as if the panel had been used. Both directions offer
+        // the same Pulse / High / Low actions; only the reach differs.
+        //
+        // The point of doing it this way is that it needs NO per-signal wiring in the host program:
+        // any Out row becomes a working control on any device.
+        //
+        // Same gates as the In direction: host kill-switch, arm, rate limit, full audit. This is a
+        // strictly bigger action (it runs program logic, not just a value write), so it is never on
+        // a lighter footing.
+        //
+        // Mechanically it asks the device's own output-sig collection to update a join and fire its
+        // change event — the identical path inbound panel traffic takes. It is reached reflectively
+        // and RESOLVED ONCE PER COLLECTION TYPE, cached, and DEGRADES to "unavailable" (hiding the
+        // Out controls) rather than throwing if a future SDK build changes shape. A resolve failure
+        // is therefore a soft, visible loss of one feature, never a crash.
+
+        // Resolves (and caches) the collection's UpdateValueWithOutIncrementWithEvent overload for
+        // the given parameter shape. Returns null if this SDK build does not expose it.
+        private System.Reflection.MethodInfo? InjectMethodFor(Type collType, Type[] sig)
+        {
+            lock (_injectGate)
+            {
+                if (_injectMethods.TryGetValue(collType, out var m)) return m;
+                try
+                {
+                    m = collType.GetMethod("UpdateValueWithOutIncrementWithEvent",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic,
+                        null, sig, null);
+                }
+                catch { m = null; }
+                _injectMethods[collType] = m;
+                return m;
+            }
+        }
+
+        // True if the Out direction can be driven for this device — used to gate the UI so those
+        // controls only appear when the mechanism actually resolved.
+        private bool CanPress(BasicTriList device)
+        {
+            try { return InjectMethodFor(device.BooleanOutput.GetType(), new[] { typeof(uint), typeof(bool) }) != null; }
+            catch { return false; }
+        }
+
+        // POST api/press?dev=&k=&act=pulse|high|low|send&v=&n=
+        // Drives an Out (out-of-panel) signal so the program's own handlers run, as if the panel
+        // had been used. Kept at this path for URL stability; "press" reads fine for what it does.
+        private void PressJoin(HttpCwsContext context)
+        {
+            string? devName = null, k = null, act = null, v = null, label = null;
+            try
+            {
+                devName = context.Request.QueryString["dev"];
+                k       = context.Request.QueryString["k"];
+                act     = context.Request.QueryString["act"];
+                v       = context.Request.QueryString["v"];
+                label   = context.Request.QueryString["n"];
+            }
+            catch { }
+
+            if (!string.IsNullOrEmpty(label))
+            {
+                if (label.Length > 64) label = label.Substring(0, 64);
+                var lb = new StringBuilder(label.Length);
+                foreach (var c in label) if (c >= ' ') lb.Append(c);
+                label = lb.ToString();
+            }
+
+            if (string.IsNullOrEmpty(k) || string.IsNullOrEmpty(act))
+            { WritePressError(context, 400, "missing k or act", devName, k, act); return; }
+
+            System.Threading.Interlocked.Exchange(ref _lastArmActivityMs, Environment.TickCount64);
+            if (!_writesAllowed)
+            { WritePressError(context, 403, "writes disabled by host", devName, k, act); return; }
+            CheckArmIdle();
+            if (!_armed)
+            { WritePressError(context, 403, "writes not armed", devName, k, act); return; }
+
+            long nowMs = Environment.TickCount64;
+            bool rateLimited;
+            lock (_devLock)   // shares the force rate limiter — both are mutations to a live system
+            {
+                if (nowMs - _forceWinMs >= 1000) { _forceWinMs = nowMs; _forceCount = 0; }
+                rateLimited = ++_forceCount > MaxForcesPerSecond;
+            }
+            if (rateLimited)
+            { WritePressError(context, 429, "rate limited", devName, k, act); return; }
+
+            // Resolve the slot and grab the concrete output collection under the lock; the actual
+            // event-raising dispatch happens off-lock (and off-thread) below.
+            WatchSlot? slot = null;
+            object? coll = null;
+            string? resolveErr = null;
+            lock (_devLock)
+            {
+                if (!TryResolveDeviceLocked(devName, out var canonName, out var device) || device == null)
+                { resolveErr = "unknown device"; }
+                else
+                {
+                    devName = canonName;
+                    var cacheKey = devName + "|" + k;
+                    if (!_joinCache.TryGetValue(cacheKey, out slot!))
+                    {
+                        _contracts.TryGetValue(devName, out var cmap);
+                        slot = ResolveKey(device, k, cmap);
+                        slot.ResolvedMs = nowMs;
+                        _joinCache[cacheKey] = slot;
+                    }
+                    slot.LastSeenMs = nowMs;
+
+                    if (slot.Error != null) resolveErr = slot.Error;
+                    else if (!slot.ReadOnly) resolveErr = "this endpoint drives Out (out-of-panel) signals; use api/join for In";
+                    else coll = OutputCollectionFor(device, slot);   // null if the SO/collection is gone
+                }
+            }
+
+            if (resolveErr != null) { WritePressError(context, 400, resolveErr, devName, k, act); return; }
+            if (coll == null)       { WritePressError(context, 500, "signal not reachable", devName, k, act); return; }
+
+            // Build the injection as a closure, validating the value/act synchronously so a bad
+            // request is a clean 400 rather than a swallowed background failure. Only the actual
+            // dispatch is deferred.
+            var slotType = slot!.Type;
+            var join     = slot.Number;
+            string auditVal;
+            Action? doInject;
+            switch (slotType)
+            {
+                case 'd':
+                {
+                    var m = InjectMethodFor(coll.GetType(), new[] { typeof(uint), typeof(bool) });
+                    if (m == null) { WritePressError(context, 501, "signal simulation unavailable on this SDK", devName, k, act); return; }
+                    var c = coll;
+                    // high/low/pulse are the canonical names, matching the page's controls and the
+                    // In direction's vocabulary. press/release/tap are kept as accepted aliases:
+                    // they describe the same three actions and cost one line each to honour.
+                    switch (act)
+                    {
+                        case "high": case "press":
+                            auditVal = "high";  doInject = () => m.Invoke(c, new object[] { join, true }); break;
+                        case "low": case "release":
+                            auditVal = "low";   doInject = () => m.Invoke(c, new object[] { join, false }); break;
+                        case "pulse": case "tap":
+                            auditVal = "pulse"; doInject = () => { m.Invoke(c, new object[] { join, true }); m.Invoke(c, new object[] { join, false }); }; break;
+                        default: WritePressError(context, 400, "act must be pulse, high or low for a digital", devName, k, act); return;
+                    }
+                    break;
+                }
+                case 'a':
+                {
+                    if (act != "send") { WritePressError(context, 400, "act must be send for an analog", devName, k, act); return; }
+                    if (!ushort.TryParse((v ?? "").Trim(), System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture, out var num))
+                    { WritePressError(context, 400, "bad analog value (0-65535)", devName, k, act); return; }
+                    var m = InjectMethodFor(coll.GetType(), new[] { typeof(uint), typeof(ushort) });
+                    if (m == null) { WritePressError(context, 501, "signal simulation unavailable on this SDK", devName, k, act); return; }
+                    var c = coll;
+                    auditVal = num.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    doInject = () => m.Invoke(c, new object[] { join, num });
+                    break;
+                }
+                default:  // 's'
+                {
+                    if (act != "send") { WritePressError(context, 400, "act must be send for a serial", devName, k, act); return; }
+                    if (v == null || !v.StartsWith("b64:", StringComparison.Ordinal) || !TryDecodeB64Url(v.Substring(4), out var text))
+                    { WritePressError(context, 400, "serial value must be base64url (\"b64:<data>\")", devName, k, act); return; }
+                    if (text.Length > 1024) { WritePressError(context, 400, "string exceeds 1024 chars", devName, k, act); return; }
+                    foreach (var ch in text) if (ch < ' ' && ch != '\t')
+                    { WritePressError(context, 400, "control characters not allowed", devName, k, act); return; }
+                    if (!EnsureSerialInject(coll.GetType()))
+                    { WritePressError(context, 501, "signal simulation unavailable on this SDK", devName, k, act); return; }
+                    var m = _serialInject!; var c = coll; var enc = _serialEnc!; var mode = _serialMode!;
+                    auditVal = text;
+                    doInject = () => m.Invoke(c, new object[] { join, text, enc, mode });
+                    break;
+                }
+            }
+
+            // Off the CWS thread: the injection raises the device's change event, so the host's
+            // SigChange handlers (and contract events) run SYNCHRONOUSLY on the calling thread. A
+            // slow or blocking handler must not stall the web server, and the handler may re-enter
+            // CwsDebug (e.g. set feedback, log) — so it runs on a worker, not the request thread.
+            var work = doInject;
+            var auditWhat = string.IsNullOrEmpty(label) ? k : label + " (" + k + ")";
+            var addr = ClientAddress(context);
+            var devForAudit = devName ?? "?";
+            CrestronInvoke.BeginInvoke(_ =>
+            {
+                try { work!(); }
+                catch (Exception e) { ErrorLog.Error("CwsDebugPage: press dispatch failed: {0}", e.Message); }
+            });
+
+            AppendAudit("Info", SafeFormat("Panel sim: {0} {1} -> {2} (from {3})",
+                new object[] { devForAudit, auditWhat, auditVal, addr }));
+
+            context.Response.StatusCode  = 200;
+            context.Response.ContentType = "application/json";
+            context.Response.Write("{\"ok\":true,\"dispatched\":true,\"k\":" + JsonString(k) + "}", true);
+        }
+
+        // The output-sig collection that owns an Out slot's join: the smart object's when the slot
+        // is SO-scoped, otherwise the device's. Returns null if the smart object is gone.
+        private static object? OutputCollectionFor(BasicTriList device, WatchSlot slot)
+        {
+            try
+            {
+                if (slot.SmartObjectId.HasValue)
+                {
+                    if (device is not BasicTriListWithSmartObject soDev || soDev.SmartObjects == null) return null;
+                    var so = soDev.SmartObjects[slot.SmartObjectId.Value];
+                    if (so == null) return null;
+                    return slot.Type switch { 'd' => so.BooleanOutput, 'a' => so.UShortOutput, _ => (object)so.StringOutput };
+                }
+                return slot.Type switch { 'd' => device.BooleanOutput, 'a' => device.UShortOutput, _ => (object)device.StringOutput };
+            }
+            catch { return null; }
+        }
+
+        // The serial overload takes two SDK enums; resolve the method by shape and derive its enum
+        // arguments (UTF-16, clear-and-end) from the method's own parameter types, so nothing here
+        // hard-references a possibly-internal enum. Resolved once.
+        private bool EnsureSerialInject(Type collType)
+        {
+            lock (_injectGate)
+            {
+                if (_serialProbed) return _serialInject != null;
+                _serialProbed = true;
+                try
+                {
+                    foreach (var m in collType.GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic))
+                    {
+                        if (m.Name != "UpdateValueWithOutIncrementWithEvent") continue;
+                        var p = m.GetParameters();
+                        if (p.Length != 4) continue;
+                        if (p[0].ParameterType != typeof(uint) || p[1].ParameterType != typeof(string)) continue;
+                        if (!p[2].ParameterType.IsEnum || !p[3].ParameterType.IsEnum) continue;
+                        // eStringEncoding.eEncodingUTF16 == 2 ; eInboundTextModes.e_InboundTextModeClearAndEnd == 3.
+                        // Replace the whole buffer with the value in one shot, matching a text-entry commit.
+                        _serialEnc  = Enum.ToObject(p[2].ParameterType, 2);
+                        _serialMode = Enum.ToObject(p[3].ParameterType, 3);
+                        _serialInject = m;
+                        break;
+                    }
+                }
+                catch { _serialInject = null; }
+                return _serialInject != null;
+            }
+        }
+
+        private void WritePressError(HttpCwsContext context, int status, string message,
+            string? dev, string? k, string? act)
+        {
+            AppendAudit("Notice", SafeFormat("Panel sim rejected: {0} {1} ({2}) -> {3} from {4}",
+                new object[] { dev ?? "?", k ?? "?", act ?? "?", message, ClientAddress(context) }));
+            context.Response.StatusCode  = status;
+            context.Response.ContentType = "application/json";
+            context.Response.Write("{\"ok\":false,\"error\":" + JsonString(message) + "}", true);
+        }
+
         // api/arm — GET reads, POST?on=1|0 sets the arm gate. Arm changes are audited.
         private void ServeArm(HttpCwsContext context, string method)
         {
@@ -694,7 +1044,7 @@ namespace CwsDebug
             try
             {
                 if (context.Request.QueryString["touch"] == "1" && _armed)
-                    _lastArmActivityMs = Environment.TickCount64;
+                    System.Threading.Interlocked.Exchange(ref _lastArmActivityMs, Environment.TickCount64);
             }
             catch { }
 
@@ -710,7 +1060,7 @@ namespace CwsDebug
                 if (on.HasValue)
                 {
                     _armed = on.Value;
-                    _lastArmActivityMs = Environment.TickCount64;
+                    System.Threading.Interlocked.Exchange(ref _lastArmActivityMs, Environment.TickCount64);
                     AppendAudit("Notice", SafeFormat("Force arm {0} (from {1})",
                         new object[] { on.Value ? "ENABLED" : "disabled", ClientAddress(context) }));
                 }
@@ -723,7 +1073,7 @@ namespace CwsDebug
                 ",\"timeoutMs\":" + _armTimeoutMs.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}", true);
         }
 
-        private void RegisterDeviceInternal(string name, BasicTriList device)
+        private void RegisterDeviceInternal(string name, BasicTriList device, string? sgdPath = null)
         {
             if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(new[] { ':', ',', '/' }) >= 0)
             {
@@ -735,22 +1085,66 @@ namespace CwsDebug
                 ErrorLog.Error("CwsDebugPage: RegisterDevice(\"{0}\") called with a null device", name);
                 return;
             }
+
+            // Optional: label smart-object numbers from the SGD's own design-time names.
+            // Same non-fatal shape as RegisterContract's manifest load — a bad or missing
+            // file only costs the labels, never the registration itself.
+            Dictionary<uint, string>? sgdNames = null;
+            if (!string.IsNullOrEmpty(sgdPath))
+            {
+                try
+                {
+                    var path = System.IO.Path.IsPathRooted(sgdPath)
+                        ? sgdPath
+                        : Path.Combine(Directory.GetApplicationDirectory(), sgdPath);
+                    if (!File.Exists(path))
+                        throw new System.IO.FileNotFoundException("SGD file not found", path);
+                    using (var reader = new StreamReader(path)) sgdNames = ParseSgdSmartObjectNames(reader);
+                }
+                catch (Exception e)
+                {
+                    ErrorLog.Error("CwsDebugPage: RegisterDevice(\"{0}\") failed to load SO names from \"{1}\": {2}",
+                        name, sgdPath, e.Message);
+                    Append("Warning", SafeFormat("Smart object names not loaded for \"{0}\" from \"{1}\": {2} — SO numbers still work",
+                        new object[] { name, sgdPath, e.Message }), Array.Empty<object>());
+                }
+            }
+
+            int soHookCount = -1;
+            var deferred = new List<Action>();
             lock (_devLock)
             {
                 if (_devices.TryGetValue(name, out var old)) // replacement: unhook + invalidate
                 {
-                    UnhookLocked(name, old);
+                    UnhookLocked(name, old, deferred);
                     DropCacheFor(name);
                 }
                 _devices[name] = device;
+                if (sgdNames != null) _soNames[name] = sgdNames;
+                else _soNames.Remove(name);
+                _sigNames.Remove(name);   // per-signal names only ever come from RegisterContract
+                // A contract map describes ONE specific device's joins, so it must not survive
+                // this name being bound to a different device. RegisterContract reinstalls it
+                // immediately after calling this, so the contract path is unaffected; what this
+                // prevents is a plain RegisterDevice(name, otherDevice) inheriting the previous
+                // occupant's manifest and then resolving c~ paths — silently, and forceably —
+                // against unrelated joins on the new device.
+                _contracts.Remove(name);
 
                 // Subscribe to the device's SigChange so output transitions (button presses,
                 // pulses) are observed the moment they happen rather than sampled at the poll
                 // cadence — a press+release inside one 2 s window would otherwise be invisible.
                 // The handler runs no host code and only touches _devLock-guarded state.
+                // The '+=' itself is deferred out of the lock for the same reason as '-=' —
+                // see UnhookLocked. Publishing the hook before attaching it is safe: an event
+                // that has not been attached yet simply does not fire.
                 SigEventHandler hook = (_, args) => OnDeviceSigChange(name, args);
-                try { device.SigChange += hook; _devHooks[name] = hook; }
-                catch { /* device torn down mid-registration — watch still works, pulses degrade to sampling */ }
+                _devHooks[name] = hook;
+                deferred.Add(() =>
+                {
+                    try { device.SigChange += hook; }
+                    catch { /* torn down mid-registration — watch still works, pulses degrade to sampling */ }
+                });
 
                 // Smart objects raise their OWN SigChange (device-level SigChange does not
                 // cover them), so each gets its own hook or SO activity lamps never light.
@@ -765,56 +1159,475 @@ namespace CwsDebug
                         {
                             var so = kv.Value;
                             if (so == null) continue;
-                            SmartObjectSigChangeEventHandler soHook = (_, args) => MarkSigActivity(name, args.Sig);
-                            so.SigChange += soHook;
+                            SmartObjectSigChangeEventHandler soHook = (_, args) => MarkSigActivity(name, args.Sig, args.SmartObjectArgs.ID);
                             hooks.Add(new KeyValuePair<SmartObject, SmartObjectSigChangeEventHandler>(so, soHook));
                         }
                     }
-                    catch { /* partial subscription is fine; unhook handles what was added */ }
-                    if (hooks.Count > 0) _soHooks[name] = hooks;
+                    catch { /* enumeration failed partway; attach whatever was collected */ }
+                    if (hooks.Count > 0)
+                    {
+                        _soHooks[name] = hooks;
+                        deferred.Add(() =>
+                        {
+                            foreach (var kv in hooks)
+                            { try { kv.Key.SigChange += kv.Value; } catch { } }
+                        });
+                    }
+                    soHookCount = hooks.Count;
                 }
             }
+            RunDeferred(deferred);        // SDK '+='/'-=' outside the lock — see UnhookLocked
             Append("Notice", SafeFormat("Device \"{0}\" registered for signals", new object[] { name }), Array.Empty<object>());
+            if (sgdNames != null)
+                Append("Notice", SafeFormat("Smart object names loaded for \"{0}\": {1} from \"{2}\"",
+                    new object[] { name, sgdNames.Count, sgdPath! }), Array.Empty<object>());
+            // Diagnostic: how many smart objects were actually present (and so hooked for live
+            // activity/logging) at the MOMENT of registration. A device whose smart objects are
+            // created lazily by later code (e.g. a Construct contract's own component wiring
+            // running after this call) can register with zero hooked here even though its joins
+            // still resolve fine by number — that only breaks the instant activity lamp/trace,
+            // never plain polling, so it is worth knowing rather than guessing at.
+            if (soHookCount >= 0)
+                Append("Info", SafeFormat("Device \"{0}\": {1} smart object(s) hooked for activity",
+                    new object[] { name, soHookCount }), Array.Empty<object>());
         }
+
+        // ── Construct/CH5 contracts ──────────────────────────────────────────────────────
+        // A contract path is just a name for an existing (SmartObjectId, Join, Type, Direction)
+        // tuple — the .cse2j manifest is the only new thing here. Once a path resolves to a
+        // ContractItem, ResolveKey turns it into the exact same WatchSlot/Sig that numeric and
+        // SGD-name addressing produce, so watch, force, arm-gating, audit and tracing all work
+        // for a contract item with no changes of their own.
+
+        /// <summary>One contract item resolved from the manifest: which smart-object join it is,
+        /// its signal type, and which direction (state = to-panel/forceable, event =
+        /// from-panel/read-only).
+        ///
+        /// Deliberately NOT carrying a "paired opposite-direction path": states and events are
+        /// numbered by two INDEPENDENT counters per smart object, so a shared (Type, SO, Join)
+        /// tuple does not mean the same logical control — confirmed on the real Masters 26 Test
+        /// manifest, where SO1/join5 is "MainVisibilityJoin" on the state side and the wholly
+        /// unrelated "Main.B1.Press" on the event side, purely by numbering coincidence. Unlike
+        /// plain smart-object addressing (where the shared-join-number heuristic was checked
+        /// against real per-object data before shipping), no reliable general rule for
+        /// contract-item pairing was found — so none is offered rather than risk a UI control
+        /// silently reading/writing the wrong signal under the wrong label.</summary>
+        private sealed class ContractItem
+        {
+            public uint SmartObjectId;
+            public uint Join;
+            public char Type;       // 'd' | 'a' | 's'
+            public bool ReadOnly;   // true = event (from panel); false = state (to panel)
+        }
+
+        private void RegisterContractInternal(string name, BasicTriListWithSmartObject device, string cse2jPath)
+        {
+            // Registers the device exactly as RegisterDevice does — same validation, same
+            // SigChange hooks, same replace/unregister semantics. Contract addressing is a
+            // strictly additive lookup layer on top.
+            RegisterDeviceInternal(name, device);
+
+            Dictionary<string, ContractItem>? map = null;
+            int dupes = 0;
+            try
+            {
+                var path = System.IO.Path.IsPathRooted(cse2jPath)
+                    ? cse2jPath
+                    : Path.Combine(Directory.GetApplicationDirectory(), cse2jPath);
+                if (!File.Exists(path))
+                    throw new System.IO.FileNotFoundException("contract manifest not found", path);
+                string json;
+                using (var reader = new StreamReader(path)) json = reader.ReadToEnd();
+                map = ParseContractManifest(json, out dupes);
+            }
+            catch (Exception e)
+            {
+                // Not fatal: the device is already registered and works via so#./numeric
+                // addressing. Only contract-name addressing is unavailable — but that must
+                // never be a SILENT failure, so it goes to both logs at a visible severity.
+                ErrorLog.Error("CwsDebugPage: RegisterContract(\"{0}\") failed to load \"{1}\": {2}",
+                    name, cse2jPath, e.Message);
+                Append("Warning", SafeFormat("Contract \"{0}\" not loaded from \"{1}\": {2} — joins still reachable by number",
+                    new object[] { name, cse2jPath, e.Message }), Array.Empty<object>());
+            }
+
+            // A CH5 smart object's sig collections (unlike an SGD-loaded one) create each Sig
+            // wrapper lazily, on first access — so until something reads a given join, it does
+            // not exist to enumerate, and the Add-bar's discovery picker (api/smartobjects) only
+            // ever shows joins someone already happened to touch. Reading every declared item
+            // once here, right at registration, materializes the whole contract up front so the
+            // picker shows everything from the start rather than growing one join at a time as
+            // rows get added. Best-effort: one bad item (a join the manifest describes but the
+            // panel doesn't actually have) is skipped, never fails the registration.
+            if (map != null)
+            {
+                foreach (var item in map.Values)
+                {
+                    try
+                    {
+                        var cso = device.SmartObjects?[item.SmartObjectId];
+                        if (cso == null) continue;
+                        _ = item.Type switch
+                        {
+                            'd' => item.ReadOnly ? cso.BooleanOutput[item.Join] : (Sig)cso.BooleanInput[item.Join],
+                            'a' => item.ReadOnly ? cso.UShortOutput[item.Join]  : (Sig)cso.UShortInput[item.Join],
+                            _   => item.ReadOnly ? cso.StringOutput[item.Join]  : (Sig)cso.StringInput[item.Join],
+                        };
+                    }
+                    catch { /* one unreachable declared item is not worth failing registration over */ }
+                }
+            }
+
+            lock (_devLock)
+            {
+                if (map != null)
+                {
+                    _contracts[name] = map;
+                    // Overwrites whatever RegisterDeviceInternal just set (nothing, since
+                    // contracts don't have an sgdPath) with names derived from the manifest
+                    // itself — display-only, so overwriting here is exactly what should happen.
+                    var (soNames, sigNames) = DeriveContractNames(map);
+                    _soNames[name] = soNames;
+                    _sigNames[name] = sigNames;
+                }
+                else
+                {
+                    _contracts.Remove(name);
+                    _soNames.Remove(name);
+                    _sigNames.Remove(name);
+                }
+                // Invalidate again now that the map is actually in place. RegisterDeviceInternal
+                // dropped the cache at the START of this call, but loading and parsing the
+                // manifest happens after that — so a page polling a c~ key during that window
+                // cached a "no contract item" error against a device that was, a moment later,
+                // going to have the contract. Resolution errors are never retried, so without
+                // this that row would show an error for the life of the program.
+                DropCacheFor(name);
+            }
+
+            if (map != null)
+                Append("Notice", SafeFormat("Contract \"{0}\" loaded: {1} item(s) from \"{2}\"",
+                    new object[] { name, map.Count, cse2jPath }), Array.Empty<object>());
+            if (dupes > 0)
+                Append("Warning", SafeFormat("Contract \"{0}\": {1} duplicate item path(s) — first declaration kept, direction may be ambiguous",
+                    new object[] { name, dupes }), Array.Empty<object>());
+        }
+
+        // Parses a Construct .cse2j manifest into a flat path -> ContractItem map. Never
+        // returns partial garbage silently: any structural surprise (missing "signals" object,
+        // a value of the wrong JSON kind) throws, so the caller's catch logs ONE clear reason
+        // rather than RegisterContract quietly ending up with an empty or wrong table. Tolerant
+        // of the real quirks found in Construct output: states/events are asymmetric shapes
+        // (join-number-keyed vs path-keyed), a page-level path can have no dot, and two
+        // list-like components in the same project can use entirely different join-numbering
+        // schemes — none of that matters here since this just enumerates whatever keys exist.
+        //
+        // <paramref name="dupes"/> counts item paths that appeared more than once. The first
+        // occurrence always wins — deliberately, and states are read first, so a path declared as
+        // both a state and an event stays FORCEABLE rather than silently becoming read-only. The
+        // count is reported to the log rather than resolved silently: this file's whole stance on
+        // contracts is that a coincidence between the state and event sides must not be quietly
+        // interpreted, and a duplicate path is exactly that kind of ambiguity.
+        private static Dictionary<string, ContractItem> ParseContractManifest(string json, out int dupes)
+        {
+            dupes = 0;
+            var map = new Dictionary<string, ContractItem>(StringComparer.Ordinal);
+            using var doc = JsonDocument.Parse(json);
+            var signals = doc.RootElement.GetProperty("signals");
+
+            // states: { "boolean"|"numeric"|"string": { "<smartObjectId>": { "<join>": "<path>" } } }
+            if (signals.TryGetProperty("states", out var states))
+            {
+                foreach (var typeProp in states.EnumerateObject())
+                {
+                    var type = SigTypeChar(typeProp.Name);
+                    if (type == '\0') continue;                 // unknown signal-type key: skip, don't fail the load
+                    foreach (var soProp in typeProp.Value.EnumerateObject())
+                    {
+                        if (!uint.TryParse(soProp.Name, out var soId)) continue;
+                        foreach (var joinProp in soProp.Value.EnumerateObject())
+                        {
+                            if (!uint.TryParse(joinProp.Name, out var join)) continue;
+                            if (joinProp.Value.ValueKind != JsonValueKind.String) continue;
+                            var path = joinProp.Value.GetString();
+                            if (string.IsNullOrEmpty(path)) continue;
+                            if (map.ContainsKey(path)) { dupes++; continue; }   // first wins
+                            map[path] = new ContractItem { SmartObjectId = soId, Join = join, Type = type, ReadOnly = false };
+                        }
+                    }
+                }
+            }
+
+            // events: { "boolean"|"numeric"|"string": { "<path>": { "joinId": N, "smartObjectId": M } } }
+            if (signals.TryGetProperty("events", out var events))
+            {
+                foreach (var typeProp in events.EnumerateObject())
+                {
+                    var type = SigTypeChar(typeProp.Name);
+                    if (type == '\0') continue;
+                    foreach (var pathProp in typeProp.Value.EnumerateObject())
+                    {
+                        var path = pathProp.Name;
+                        if (!pathProp.Value.TryGetProperty("joinId", out var joinEl) ||
+                            !pathProp.Value.TryGetProperty("smartObjectId", out var soEl)) continue;
+                        // TryGet, not Get: GetUInt32 THROWS on a value that is a JSON string, a
+                        // negative, or out of range, and that exception would propagate out of
+                        // this method and lose the ENTIRE manifest over one malformed item. The
+                        // states loop above is already tolerant the same way; match it, so one
+                        // odd entry costs one item rather than all contract-name addressing.
+                        if (!soEl.TryGetUInt32(out var soId) || !joinEl.TryGetUInt32(out var join)) continue;
+                        if (map.ContainsKey(path)) { dupes++; continue; }   // first (state) wins — see below
+                        map[path] = new ContractItem
+                        {
+                            SmartObjectId = soId,
+                            Join = join,
+                            Type = type,
+                            ReadOnly = true,
+                        };
+                    }
+                }
+            }
+
+            // No pairing pass: see the "deliberately NOT carrying" note on ContractItem — a
+            // shared (Type, SmartObjectId, Join) between a state and an event does not reliably
+            // mean the same logical control, so nothing is inferred from it here.
+            return map;
+        }
+
+        // Maps a .cse2j signal-type key to the same type character used everywhere else in
+        // this file. Returns '\0' for anything unrecognized so the caller can skip it rather
+        // than crash the whole manifest load over one unexpected key.
+        private static char SigTypeChar(string cse2jType) => cse2jType switch
+        {
+            "boolean" => 'd',
+            "numeric" => 'a',
+            "string"  => 's',
+            _         => '\0',
+        };
+
+        // Derives display-only labels from a contract's own item paths: a smart-object name
+        // (for the Add-bar's SO# field) and a per-signal name (for the named-sig picker inside
+        // an SO, replacing CH5's generic "Bool Sig Number N").
+        //
+        // The SO name is the LONGEST COMMON DOT-BOUNDED PREFIX shared by every item on that SO
+        // — not just "everything before one item's last dot". That distinction matters for a
+        // component like an H-Button-List, which puts many buttons' signals on ONE smart
+        // object: "Main.HButtonList.Button1.ButtonPress", "...Button2.ButtonPress", plus
+        // SO-wide ones like "Main.HButtonList.ListVisibleJoin". Taking "everything before the
+        // last dot" of whichever item happened to be seen first would misname the SO after one
+        // specific button; the common prefix across ALL of them ("Main.HButtonList") is right
+        // regardless of which item is looked at.
+        //
+        // Each item's own signal name is then whatever is LEFT after stripping that common
+        // prefix — "Button3.ButtonPress" for a button's press, "ListVisibleJoin" for the
+        // SO-wide one, "Left"/"Right"/... for a Dpad. Stripping a prefix common to the whole
+        // group can never collide two different items, since their full paths were already
+        // unique keys in the manifest. When an SO has no usable common prefix (a mix of
+        // unrelated page-level items, e.g. one page's B1/B2/NewSlider all landing on SO1 with
+        // nothing but "Main" in common) the item just keeps its full contract path as its name
+        // instead — more to read, but never wrong and never a false pairing.
+        private static (Dictionary<uint, string> SoNames, Dictionary<string, string> SigNames)
+            DeriveContractNames(Dictionary<string, ContractItem> map)
+        {
+            var pathsBySo = new Dictionary<uint, List<string>>();
+            foreach (var kv in map)
+            {
+                if (!pathsBySo.TryGetValue(kv.Value.SmartObjectId, out var list))
+                    pathsBySo[kv.Value.SmartObjectId] = list = new List<string>();
+                list.Add(kv.Key);
+            }
+
+            var fullPrefixes = new Dictionary<uint, string>();   // used for signal-name stripping
+            var soNames = new Dictionary<uint, string>();        // shortened, for display only
+            foreach (var kv in pathsBySo)
+            {
+                // A page-level, dot-less path (e.g. "MainVisibilityJoin") shares no dot boundary
+                // with anything, so leaving it in the character-by-character reduction can
+                // collapse the WHOLE group's prefix to "" even though every other item on that
+                // same SO clearly belongs to one common component (e.g. everything else here is
+                // "Main.<Widget>.<Signal>"). It contributes nothing to a shared prefix either
+                // way (nothing anchors to it, per the '.' boundary check right below), so it is
+                // excluded from the computation rather than allowed to poison it — its own name
+                // is unaffected, since it already falls back to its full path regardless.
+                var dotted = kv.Value.FindAll(p => p.IndexOf('.') >= 0);
+                if (dotted.Count == 0) continue;
+                var prefix = CommonDotPrefix(dotted);
+                if (prefix.Length == 0) continue;
+                fullPrefixes[kv.Key] = prefix;
+                soNames[kv.Key] = ShortenSoDisplayName(prefix);
+            }
+
+            var sigNames = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var kv in map)
+            {
+                var item = kv.Value;
+                string leaf = kv.Key;
+                if (fullPrefixes.TryGetValue(item.SmartObjectId, out var prefix)
+                    && kv.Key.Length > prefix.Length + 1 && kv.Key.StartsWith(prefix, StringComparison.Ordinal)
+                    && kv.Key[prefix.Length] == '.')
+                {
+                    leaf = kv.Key.Substring(prefix.Length + 1);
+                }
+                sigNames[SigNameKey(item.SmartObjectId, item.Type, item.ReadOnly, item.Join)] = leaf;
+            }
+
+            return (soNames, sigNames);
+        }
+
+        // Longest prefix shared by every path in the group, trimmed back to the last full '.'
+        // segment so it can never cut a token in half (e.g. "Button1"/"Button2" sharing the
+        // literal characters "Button" must trim back to nothing beyond their own common parent,
+        // not stop mid-word). A single-path group degenerates to "everything before its own
+        // last dot", matching a plain non-indexed component. Signal-name stripping (see
+        // DeriveContractNames) always uses this FULL prefix, unshortened — only the SO's own
+        // display name shortens it further (see ShortenSoDisplayName).
+        private static string CommonDotPrefix(List<string> paths)
+        {
+            var common = paths[0];
+            for (int i = 1; i < paths.Count && common.Length > 0; i++)
+            {
+                var p = paths[i];
+                int len = 0, max = Math.Min(common.Length, p.Length);
+                while (len < max && common[len] == p[len]) len++;
+                common = common.Substring(0, len);
+            }
+            var lastDot = common.LastIndexOf('.');
+            return lastDot > 0 ? common.Substring(0, lastDot) : "";
+        }
+
+        // A repeated list item (e.g. ButtonWList's Items[0]) gets one smart object per instance,
+        // so the common prefix above continues PAST the index into Construct's own internal
+        // per-widget wrapper structure — confirmed on the real Masters 26 Test manifest, where
+        // every item under "Items[0].ButtonWidgetCONTRACT.WidgetButton" repeats that exact
+        // wrapper name. None of that continuation past the index distinguishes anything; it is
+        // boilerplate the SO's DISPLAY name doesn't need, even though signal names still strip
+        // the full, unshortened prefix (so a signal's own name keeps whatever the wrapper name
+        // added, which is still safely unique — just more to read). Truncating right after the
+        // last "]" keeps the part that actually identifies which item this SO is. A prefix with
+        // no "]" (a non-indexed component) is returned unchanged.
+        private static string ShortenSoDisplayName(string prefix)
+        {
+            var lastBracket = prefix.LastIndexOf(']');
+            return lastBracket > 0 ? prefix.Substring(0, lastBracket + 1) : prefix;
+        }
+
+        // Composite lookup key for a per-signal friendly name, sharing the same type/direction
+        // grammar as watch keys elsewhere in this file (e.g. "od5" = output-direction digital
+        // join 5) so it reads consistently for anyone already used to that grammar.
+        private static string SigNameKey(uint soId, char type, bool readOnly, uint join) =>
+            soId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|"
+            + (readOnly ? "o" : "") + type + join.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        // Reads smart-object ID -> design-time name out of a VT Pro-e .sgd file. The format is
+        // not XML/JSON — it is Crestron's own "[block]key=value[/block]" text format — but every
+        // smart object's block carries a "Hint" line of the exact shape
+        // "Hint=<ControlName> (Smart Object ID=<N>)", which is already the friendliest label
+        // available (it is what VT Pro-e itself shows for the object) and needs no other field
+        // in the block to be useful. Line-by-line, tolerant of any block structure around it;
+        // an .sgd with no such lines simply yields an empty map rather than an error, since the
+        // format is "whatever this VT Pro-e version wrote" and not a contract to validate against.
+        // Takes an open reader rather than the whole file as a string: an SGD for a large project
+        // is multi-megabyte, and buffering all of it just to run a per-line regex is a big
+        // transient allocation on a constrained heap at startup. Matching per line also bounds
+        // the regex's work per call, so a pathological single-line file cannot turn into one
+        // enormous match attempt.
+        private static Dictionary<uint, string> ParseSgdSmartObjectNames(StreamReader reader)
+        {
+            var names = new Dictionary<uint, string>();
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                if (line.IndexOf("Hint", StringComparison.Ordinal) < 0) continue;   // cheap pre-filter
+                Match m;
+                try { m = SgdHintRegex.Match(line); }
+                catch (RegexMatchTimeoutException) { continue; }                    // pathological line: skip it
+                if (!m.Success) continue;
+                if (!uint.TryParse(m.Groups[2].Value, System.Globalization.NumberStyles.None,
+                        System.Globalization.CultureInfo.InvariantCulture, out var soId)) continue;
+                var label = m.Groups[1].Value.Trim();
+                if (label.Length == 0) continue;
+                if (!names.ContainsKey(soId)) names[soId] = label;   // first Hint for an ID wins
+            }
+            return names;
+        }
+
+        // No RegexOptions.Compiled: this runs once per registration, so paying JIT to build a
+        // compiled matcher costs more than it saves. The timeout is a backstop only — the pattern
+        // has no nested quantifier to blow up on — but it is free insurance against a
+        // pathological line in a file this class does not control the shape of.
+        private static readonly Regex SgdHintRegex =
+            new(@"Hint\s*=\s*(.+?)\s*\(Smart Object ID\s*=\s*(\d+)\)",
+                RegexOptions.None, TimeSpan.FromSeconds(2));
 
         private bool UnregisterDeviceInternal(string name)
         {
             if (string.IsNullOrEmpty(name)) return false;
+            var deferred = new List<Action>();
+            bool found;
             lock (_devLock)
             {
-                if (!_devices.TryGetValue(name, out var device)) return false;
-                UnhookLocked(name, device);
-                _devices.Remove(name);
-                DropCacheFor(name);
-                return true;
+                found = _devices.TryGetValue(name, out var device);
+                if (found)
+                {
+                    UnhookLocked(name, device!, deferred);
+                    _devices.Remove(name);
+                    _contracts.Remove(name);
+                    _soNames.Remove(name);
+                    _sigNames.Remove(name);
+                    DropCacheFor(name);
+                }
             }
+            RunDeferred(deferred);        // SDK '-=' outside the lock — see UnhookLocked
+            return found;
         }
 
         private void UnregisterAllDevicesInternal()
         {
+            var deferred = new List<Action>();
             lock (_devLock)
             {
-                foreach (var kv in _devices) UnhookLocked(kv.Key, kv.Value);
+                foreach (var kv in _devices) UnhookLocked(kv.Key, kv.Value, deferred);
                 _devices.Clear();
+                _contracts.Clear();
+                _soNames.Clear();
+                _sigNames.Clear();
                 _joinCache.Clear();
             }
+            RunDeferred(deferred);
         }
 
-        // Detaches a device's SigChange hook plus any smart-object hooks. Caller holds _devLock.
-        private void UnhookLocked(string name, BasicTriList device)
+        // Runs queued attach/detach work after _devLock has been released. Each item already
+        // guards itself; this only makes sure one failure cannot skip the rest.
+        private static void RunDeferred(List<Action> deferred)
+        {
+            foreach (var a in deferred) { try { a(); } catch { } }
+        }
+
+        // Forgets a device's hooks and QUEUES the actual detach work for the caller to run after
+        // releasing _devLock. Caller holds _devLock.
+        //
+        // The bookkeeping (dictionary removal) must happen under the lock; the SDK '-=' must NOT.
+        // Subscribing/unsubscribing enters the SDK's own event lock, and the SDK holds that same
+        // lock while dispatching handlers — handlers which call MarkSigActivity, which takes
+        // _devLock. Doing '-=' under _devLock therefore takes the two locks in the opposite order
+        // from the dispatch path and can deadlock, most likely exactly when a busy panel is being
+        // re-registered. Deferring costs nothing: once the hook is out of the dictionaries an
+        // in-flight callback is already a no-op as far as this class is concerned.
+        private void UnhookLocked(string name, BasicTriList device, List<Action> deferred)
         {
             if (_devHooks.TryGetValue(name, out var hook))
             {
-                try { device.SigChange -= hook; } catch { /* device already disposed */ }
                 _devHooks.Remove(name);
+                deferred.Add(() => { try { device.SigChange -= hook; } catch { /* already disposed */ } });
             }
             if (_soHooks.TryGetValue(name, out var soHooks))
             {
-                foreach (var kv in soHooks)
-                {
-                    try { kv.Key.SigChange -= kv.Value; } catch { /* already disposed */ }
-                }
                 _soHooks.Remove(name);
+                deferred.Add(() =>
+                {
+                    foreach (var kv in soHooks)
+                    { try { kv.Key.SigChange -= kv.Value; } catch { /* already disposed */ } }
+                });
             }
         }
 
@@ -826,13 +1639,26 @@ namespace CwsDebug
         // RISING edge — a press-and-release is one activity blip on the page, not two — while
         // the rev still bumps on both edges so the state badge tracks correctly. Exceptions
         // must never escape into Crestron's event dispatch.
-        private void MarkSigActivity(string deviceName, Sig? sig)
+        //
+        // <paramref name="smartObjectId"/> enables a fallback match by (SmartObjectId, Number,
+        // Type) when reference equality misses. This matters specifically for smart objects
+        // that are not backed by an SGD (Construct/CH5's XpanelForHtml5): those sig collections
+        // create their Sig wrapper objects lazily and do not guarantee the SAME instance comes
+        // back on every access, unlike an SGD-loaded panel's pre-populated, stable sig graph —
+        // confirmed live on the Masters 26 Test panel, where a Dpad press reached the program's
+        // own contract event handler but never reached this hook via ReferenceEquals. Scoped to
+        // ReadOnly (event/output-direction) slots only: those are addressed purely by number
+        // with no matching Input-side object to collide with, so the fallback cannot cross-match
+        // the wrong direction the way it could for a plain forceable join. On a fallback match,
+        // the slot adopts the live Sig going forward, so later polls read the current object too.
+        private void MarkSigActivity(string deviceName, Sig? sig, uint? smartObjectId = null)
         {
             try
             {
                 if (sig == null) return;
                 bool countActivity = true;
-                try { if (sig.Type == eSigType.Bool) countActivity = sig.BoolValue; } catch { }
+                eSigType sigType = eSigType.NA;
+                try { sigType = sig.Type; if (sigType == eSigType.Bool) countActivity = sig.BoolValue; } catch { }
 
                 var prefix = deviceName + "|";
                 List<string>? traces = null;
@@ -843,7 +1669,15 @@ namespace CwsDebug
                     {
                         if (!kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
                         var slot = kv.Value;
-                        if (slot.Sig == null || !ReferenceEquals(slot.Sig, sig)) continue;
+                        bool isMatch = slot.Sig != null && ReferenceEquals(slot.Sig, sig);
+                        if (!isMatch && smartObjectId.HasValue && slot.ReadOnly
+                            && slot.SmartObjectId == smartObjectId.Value && slot.Number == sig.Number
+                            && SigTypeMatches(slot.Type, sigType))
+                        {
+                            isMatch = true;
+                            slot.Sig = sig;   // adopt the live object so future polls stay in sync too
+                        }
+                        if (!isMatch) continue;
                         if (countActivity) slot.Changes++;
                         slot.Rev = ++_joinRev;
 
@@ -863,6 +1697,36 @@ namespace CwsDebug
             catch { /* never throw into the device's event dispatch */ }
         }
 
+        private static bool SigTypeMatches(char slotType, eSigType sdkType) => slotType switch
+        {
+            'd' => sdkType == eSigType.Bool,
+            'a' => sdkType == eSigType.UShort,
+            's' => sdkType == eSigType.String,
+            _   => false,
+        };
+
+        // Resolves a client-supplied device name (or none, when exactly one is registered) to the
+        // device AND to the name as it was actually REGISTERED. Callers must use the registered
+        // spelling for cache keys and for the "dev" field they echo back: device names compare
+        // case-insensitively, so "Panel" and "PANEL" reach the same device but would otherwise
+        // get separate _joinCache slots for the same signal — which MarkSigActivity then matches
+        // both of (its prefix test is case-insensitive too), double-bumping the revision and
+        // writing every traced change to the log twice. Caller holds _devLock.
+        private bool TryResolveDeviceLocked(string? requested, out string name, out BasicTriList? device)
+        {
+            name = ""; device = null;
+            if (string.IsNullOrEmpty(requested))
+            {
+                if (_devices.Count != 1) return false;
+                foreach (var kv in _devices) { name = kv.Key; device = kv.Value; }
+                return true;
+            }
+            foreach (var kv in _devices)
+                if (string.Equals(kv.Key, requested, StringComparison.OrdinalIgnoreCase))
+                { name = kv.Key; device = kv.Value; return true; }
+            return false;
+        }
+
         // Removes every cached resolution belonging to a device. Caller holds _devLock.
         private void DropCacheFor(string deviceName)
         {
@@ -880,8 +1744,11 @@ namespace CwsDebug
             public char    Type;                 // 'd' | 'a' | 's'
             public bool    ReadOnly;             // output-direction sig (device -> program)
             public uint    Number;               // resolved join number (useful for ~name keys)
+            public uint?   SmartObjectId;         // set for so<id>./c~ addressing; null for plain device joins.
+                                                   // Fallback match key for MarkSigActivity — see its comment.
             public bool    ByName;               // key addressed the sig by SGD name
-            public string? Error;                // resolution failure, reported per-row, never retried
+            public string? Error;                // resolution failure, reported per-row; retried on a timer (see ServeJoins)
+            public long    ResolvedMs;           // when Error was last (re)computed, for that retry
             public string  LastRendered = "";    // last value (or error) as rendered into JSON
             public long    Rev;                  // _joinRev at the last observed change
             public long    LastSeenMs;           // for cache eviction
@@ -899,13 +1766,47 @@ namespace CwsDebug
         // Key grammar (numeric canonical; '~name' addresses smart-object sigs by SGD name):
         //   ("o")? ("d"|"a"|"s") <num>                          e.g. d5, od5, a12, s1
         //   "so" <id> "." ("o")? ("d"|"a"|"s") (<num>|"~"name)  e.g. so1.d3, so1.d~Item 1 Visible
-        private static WatchSlot ResolveKey(BasicTriList device, string rawKey)
+        //   "c~" <contract item path>                           e.g. c~Main.B1.Press
+        //     (looked up in a device's loaded Construct manifest — see RegisterContract; the
+        //     manifest itself already carries type/direction/join, so there is nothing to parse)
+        private static WatchSlot ResolveKey(BasicTriList device, string rawKey, Dictionary<string, ContractItem>? contractMap = null)
         {
             var slot = new WatchSlot();
             try
             {
                 var key = rawKey.Trim();
                 if (key.Length < 2) { slot.Error = "bad key"; return slot; }
+
+                // Construct contract addressing: "c~<dotted item path>", e.g. "c~Main.B1.Press".
+                // The manifest already resolved this to a concrete (SmartObjectId, Join, Type,
+                // Direction), so this is a lookup, not a parse — no d/a/s/so grammar applies.
+                if (key.StartsWith("c~", StringComparison.Ordinal))
+                {
+                    var path = key.Substring(2);
+                    if (path.Length == 0) { slot.Error = "bad key (empty contract path)"; return slot; }
+                    if (contractMap == null || !contractMap.TryGetValue(path, out var item))
+                    { slot.Error = "no contract item \"" + path + "\""; return slot; }
+                    if (device is not BasicTriListWithSmartObject cSoDev)
+                    { slot.Error = "device has no smart objects"; return slot; }
+
+                    slot.Type = item.Type; slot.ReadOnly = item.ReadOnly; slot.Number = item.Join; slot.ByName = true;
+                    slot.SmartObjectId = item.SmartObjectId;
+                    try
+                    {
+                        var cso = cSoDev.SmartObjects?[item.SmartObjectId];
+                        if (cso != null)
+                            slot.Sig = item.Type switch
+                            {
+                                'd' => item.ReadOnly ? cso.BooleanOutput[item.Join] : (Sig)cso.BooleanInput[item.Join],
+                                'a' => item.ReadOnly ? cso.UShortOutput[item.Join]  : (Sig)cso.UShortInput[item.Join],
+                                _   => item.ReadOnly ? cso.StringOutput[item.Join]  : (Sig)cso.StringInput[item.Join],
+                            };
+                    }
+                    catch { slot.Sig = null; }
+                    if (slot.Sig == null)
+                    { slot.Error = "contract item \"" + path + "\" (smart object " + item.SmartObjectId + " join " + item.Join + ") out of range"; return slot; }
+                    return slot;
+                }
 
                 // Optional smart-object scope: "so<id>."
                 SmartObject? so = null;
@@ -922,6 +1823,7 @@ namespace CwsDebug
                     try { so = soDev.SmartObjects?[soId]; }
                     catch { so = null; }
                     if (so == null) { slot.Error = "no smart object " + soId; return slot; }
+                    slot.SmartObjectId = soId;
                     key = key.Substring(dot + 1);
                     if (key.Length < 2) { slot.Error = "bad key"; return slot; }
                 }
@@ -1050,13 +1952,17 @@ namespace CwsDebug
                     {
                         if (d is BasicTriListWithSmartObject { SmartObjects: not null } soDev)
                         {
+                            _soNames.TryGetValue(kv.Key, out var soNames);   // still under _devLock
                             sb.Append(",\"smartObjects\":true,\"soIds\":[");
                             bool f2 = true;
                             foreach (var so in soDev.SmartObjects)
                             {
                                 if (!f2) sb.Append(',');
                                 f2 = false;
-                                sb.Append(so.Key.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                                sb.Append("{\"id\":").Append(so.Key.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                                if (soNames != null && soNames.TryGetValue(so.Key, out var label))
+                                    sb.Append(",\"name\":").Append(JsonString(label));
+                                sb.Append('}');
                             }
                             sb.Append(']');
                         }
@@ -1076,6 +1982,49 @@ namespace CwsDebug
         // Same cursor contract as api/logs: since <= 0 returns every watched key, otherwise
         // only keys whose value changed since that rev. The page re-polls with since=0
         // whenever its watch set changes. Phase 1: strictly read-only.
+        // Reads the POST form of api/joins: {"dev":"..","since":N,"w":"k1,k2","t":"k1:<b64>,k2"}.
+        // The w/t values are the SAME comma-joined strings the query string uses — deliberately,
+        // so the body changes only how they TRAVEL and every parsing rule downstream (including
+        // base64url labels) stays byte-identical and is exercised by both transports.
+        // Returns false only for a body that is present but unusable; an absent or empty body
+        // leaves the query-string values untouched.
+        private static bool ReadJoinsBody(HttpCwsContext context, ref string? dev, ref long since,
+                                          ref string? w, ref string? t)
+        {
+            try
+            {
+                var stream = context.Request.InputStream;
+                if (stream == null) return true;
+                if (stream.CanSeek) stream.Position = 0;
+
+                // Read the bytes directly rather than wrapping in a StreamReader: the SDK hands
+                // back a MemoryStream it CACHES on the request, so disposing a reader around it
+                // would dispose that cached stream too. Also bounds the read as it goes, so an
+                // oversized body is rejected without being buffered in full first.
+                var buf = new System.IO.MemoryStream();
+                var chunk = new byte[4096];
+                int n, total = 0;
+                while ((n = stream.Read(chunk, 0, chunk.Length)) > 0)
+                {
+                    total += n;
+                    if (total > MaxBodyLen) return false;
+                    buf.Write(chunk, 0, n);
+                }
+                if (total == 0) return true;
+                var json = Encoding.UTF8.GetString(buf.GetBuffer(), 0, (int)buf.Length);
+
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object) return false;
+                if (root.TryGetProperty("dev", out var de) && de.ValueKind == JsonValueKind.String) dev = de.GetString();
+                if (root.TryGetProperty("since", out var se) && se.TryGetInt64(out var sv)) since = sv;
+                if (root.TryGetProperty("w", out var we) && we.ValueKind == JsonValueKind.String) w = we.GetString();
+                if (root.TryGetProperty("t", out var te) && te.ValueKind == JsonValueKind.String) t = te.GetString();
+                return true;
+            }
+            catch { return false; }
+        }
+
         private void ServeJoins(HttpCwsContext context)
         {
             long since = 0;
@@ -1090,12 +2039,30 @@ namespace CwsDebug
             }
             catch { /* malformed request — treated as empty below */ }
 
+            // POST carries the same parameters in a JSON body instead of the query string. The
+            // page always POSTs: the watch set and the traced set are re-sent on EVERY poll (that
+            // is what makes tracing lapse by itself when the page goes away), and with dozens of
+            // logged signals plus their names that set is far too big to keep pushing through a
+            // URL — no maximum query-string length is documented for CWS, and exceeding whatever
+            // it is would break polling for the whole device rather than degrade. GET is still
+            // accepted, unchanged, so a single join is still checkable straight from a browser.
+            if (string.Equals(context.Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase)
+                && !ReadJoinsBody(context, ref devName, ref since, ref w, ref t))
+            { WriteJsonError(context, 400, "bad request body"); return; }
+
             if (string.IsNullOrEmpty(w))
             { WriteJsonError(context, 400, "missing w"); return; }
 
             var keys = w.Split(',');
             if (keys.Length > MaxWatchKeys)
             { WriteJsonError(context, 400, "too many watch keys"); return; }
+            // Every accepted key can become a _joinCache dictionary key, so cap its length too:
+            // the count cap alone still admits a handful of megabyte-long keys. MaxKeyLen is far
+            // above any real key (the longest legitimate form is a contract path, and those are
+            // bounded by the manifest) so this only ever rejects abuse or corruption.
+            foreach (var rk in keys)
+                if (rk.Length > MaxKeyLen)
+                { WriteJsonError(context, 400, "watch key too long"); return; }
 
             // Which of these signals the page wants written to the log. Re-sent on every poll,
             // so tracing lapses on its own once the page stops asking - closing the browser
@@ -1122,13 +2089,15 @@ namespace CwsDebug
             var traceLines = new List<string>();
 
             var sb = new StringBuilder();
+            bool unknownDevice = false;
             lock (_devLock)
             {
-                BasicTriList? device = null;
-                if (!string.IsNullOrEmpty(devName)) _devices.TryGetValue(devName, out device);
-                else if (_devices.Count == 1) foreach (var kv in _devices) { devName = kv.Key; device = kv.Value; }
-                if (device == null)
-                { WriteJsonError(context, 404, "unknown device"); return; }
+                if (!TryResolveDeviceLocked(devName, out var canonName, out var device) || device == null)
+                    unknownDevice = true;
+                else
+                {
+                devName = canonName;                      // cache under the REGISTERED spelling
+                _contracts.TryGetValue(devName, out var cmap);
 
                 EvictJoinCache();
                 long nowMs = Environment.TickCount64;
@@ -1144,8 +2113,35 @@ namespace CwsDebug
                     var cacheKey = devName + "|" + key;
                     if (!_joinCache.TryGetValue(cacheKey, out var slot))
                     {
-                        slot = ResolveKey(device, key);
+                        slot = ResolveKey(device, key, cmap);
+                        slot.ResolvedMs = nowMs;
                         _joinCache[cacheKey] = slot;
+                    }
+                    else if (slot.Error != null && nowMs - slot.ResolvedMs >= ErrorRetryMs)
+                    {
+                        // A resolution error is not necessarily permanent: the thing the key needs
+                        // may simply not have existed yet. Smart objects appear when the SGD is
+                        // loaded, a contract map lands after its file is parsed, a lazily-created
+                        // CH5 sig appears on first touch — and a page polling across program start
+                        // can easily ask before any of that. Without a retry the row shows an error
+                        // for the life of the program even though the same key now resolves fine.
+                        // Retried on a timer rather than every poll so a genuinely bad key costs
+                        // one resolve every few seconds, not four per second forever.
+                        var retried = ResolveKey(device, key, cmap);
+                        retried.ResolvedMs = nowMs;
+                        if (retried.Error == null)
+                        {
+                            // Carry the tracing bookkeeping across so a row that recovers does not
+                            // silently lose its Log setting mid-session. Value history deliberately
+                            // starts fresh: there is none worth keeping from an errored slot, and a
+                            // blank LastRendered guarantees the revision bumps so the page repaints.
+                            retried.Trace        = slot.Trace;
+                            retried.TraceUntilMs = slot.TraceUntilMs;
+                            retried.TraceLabel   = slot.TraceLabel;
+                            _joinCache[cacheKey] = retried;
+                            slot = retried;
+                        }
+                        else slot.ResolvedMs = nowMs;   // still broken: restart the retry clock
                     }
                     slot.LastSeenMs = nowMs;
 
@@ -1207,11 +2203,20 @@ namespace CwsDebug
                 CheckArmIdle();
                 sb.Append(",\"armed\":").Append(_armed ? "true" : "false");
                 sb.Append(",\"writesAllowed\":").Append(_writesAllowed ? "true" : "false");
+                // Whether this device supports simulated presses on its In rows (the mechanism
+                // resolved on this SDK build). Per-device because it depends on the device's own
+                // collection type; the page uses it to show or hide the Press/Tap/Release buttons.
+                sb.Append(",\"canPress\":").Append(CanPress(device) ? "true" : "false");
                 try { sb.Append(",\"online\":").Append(device.IsOnline ? "true" : "false"); } catch { }
                 sb.Append(",\"joins\":[").Append(entries).Append("]}");
+                }
             }
 
-            // Outside _devLock, per the ordering invariant.
+            // Outside _devLock, per the ordering invariant (WriteJsonError and Append both take
+            // _lock; neither may be called while _devLock is held).
+            if (unknownDevice)
+            { WriteJsonError(context, 404, "unknown device"); return; }
+
             foreach (var line in traceLines) Append("Info", line, Array.Empty<object>());
 
             context.Response.StatusCode  = 200;
@@ -1237,14 +2242,22 @@ namespace CwsDebug
             { WriteJsonError(context, 400, "missing or bad id"); return; }
 
             SmartObject? so = null;
+            string? soName = null;
+            Dictionary<string, string>? sigNames = null;
+            bool isContract = false;
             lock (_devLock)
             {
-                BasicTriList? device = null;
-                if (!string.IsNullOrEmpty(devName)) _devices.TryGetValue(devName, out device);
-                else if (_devices.Count == 1) foreach (var kv in _devices) { devName = kv.Key; device = kv.Value; }
-                if (device is BasicTriListWithSmartObject { SmartObjects: not null } soDev)
+                if (TryResolveDeviceLocked(devName, out var canonName, out var device))
                 {
-                    try { so = soDev.SmartObjects[soId]; } catch { so = null; }
+                    devName = canonName;                  // echo back the REGISTERED spelling
+                    if (device is BasicTriListWithSmartObject { SmartObjects: not null } soDev)
+                    {
+                        try { so = soDev.SmartObjects[soId]; } catch { so = null; }
+                    }
+                    if (_soNames.TryGetValue(devName, out var names))
+                        names.TryGetValue(soId, out soName);
+                    _sigNames.TryGetValue(devName, out sigNames);
+                    isContract = _contracts.ContainsKey(devName);
                 }
             }
             if (so == null)
@@ -1253,18 +2266,26 @@ namespace CwsDebug
             var sb = new StringBuilder();
             sb.Append("{\"dev\":").Append(JsonString(devName ?? ""));
             sb.Append(",\"id\":").Append(soId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            if (soName != null) sb.Append(",\"name\":").Append(JsonString(soName));
+            // A contract's states and events are numbered by two INDEPENDENT counters, so a
+            // shared number between them is coincidence, not a real pairing — confirmed on this
+            // exact manifest, where join 1005 is BOTH "Button1Enabled" (a state) and
+            // "Button5ItemPress" (a wholly unrelated event). The front end uses this flag to
+            // turn the number-based "Both" pairing off entirely for a contract device, the same
+            // way RegisterContract's own ContractItem already refuses to guess at pairing.
+            sb.Append(",\"contract\":").Append(isContract ? "true" : "false");
             sb.Append(",\"sigs\":{");
-            AppendSigList(sb, "din",  () => so.BooleanInput);
+            AppendSigList(sb, "din",  () => so.BooleanInput,  sigNames, soId, 'd', false);
             sb.Append(',');
-            AppendSigList(sb, "dout", () => so.BooleanOutput);
+            AppendSigList(sb, "dout", () => so.BooleanOutput, sigNames, soId, 'd', true);
             sb.Append(',');
-            AppendSigList(sb, "ain",  () => so.UShortInput);
+            AppendSigList(sb, "ain",  () => so.UShortInput,   sigNames, soId, 'a', false);
             sb.Append(',');
-            AppendSigList(sb, "aout", () => so.UShortOutput);
+            AppendSigList(sb, "aout", () => so.UShortOutput,  sigNames, soId, 'a', true);
             sb.Append(',');
-            AppendSigList(sb, "sin",  () => so.StringInput);
+            AppendSigList(sb, "sin",  () => so.StringInput,   sigNames, soId, 's', false);
             sb.Append(',');
-            AppendSigList(sb, "sout", () => so.StringOutput);
+            AppendSigList(sb, "sout", () => so.StringOutput,  sigNames, soId, 's', true);
             sb.Append("}}");
 
             context.Response.StatusCode  = 200;
@@ -1276,7 +2297,15 @@ namespace CwsDebug
         // (collection null, enumeration throws) yields an empty list rather than a failed response.
         // Non-generic on purpose: the SDK's sig-collection nullability annotations fight a
         // Sig-constrained generic, and a runtime type check is all that's actually needed.
-        private static void AppendSigList(StringBuilder sb, string key, Func<System.Collections.IEnumerable?> get)
+        //
+        // <paramref name="sigNames"/> (contract devices only) adds a "friendly" field with the
+        // contract's own leaf name (e.g. "Left") alongside CH5's generic "name" ("Bool Sig
+        // Number 5") when one is known for this exact (smart object, type, direction, join).
+        // "name" is left exactly as the SDK reports it — it is what "~name" addressing resolves
+        // against, so it must stay the string that actually exists on the sig regardless of any
+        // friendlier label being available for display.
+        private static void AppendSigList(StringBuilder sb, string key, Func<System.Collections.IEnumerable?> get,
+            Dictionary<string, string>? sigNames, uint soId, char type, bool readOnly)
         {
             sb.Append('"').Append(key).Append("\":[");
             try
@@ -1291,10 +2320,14 @@ namespace CwsDebug
                         string name;
                         uint num;
                         try { name = sig.Name ?? ""; num = sig.Number; } catch { continue; }
+                        string? friendly = null;
+                        sigNames?.TryGetValue(SigNameKey(soId, type, readOnly, num), out friendly);
                         if (!first) sb.Append(',');
                         first = false;
                         sb.Append("{\"n\":").Append(num.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                        sb.Append(",\"name\":").Append(JsonString(name)).Append('}');
+                        sb.Append(",\"name\":").Append(JsonString(name));
+                        if (friendly != null) sb.Append(",\"friendly\":").Append(JsonString(friendly));
+                        sb.Append('}');
                     }
                 }
             }
@@ -1312,6 +2345,19 @@ namespace CwsDebug
             foreach (var kv in _joinCache)
                 if (kv.Value.LastSeenMs < cutoff) stale.Add(kv.Key);
             foreach (var k in stale) _joinCache.Remove(k);
+
+            // The age pass alone does NOT bound the cache: the watch set is client-supplied and
+            // unauthenticated, so a caller polling fresh keys keeps every entry young and the
+            // age cutoff never fires. That matters more than memory — MarkSigActivity walks this
+            // whole dictionary under _devLock on the sig-dispatch thread for every signal edge,
+            // so an oversized cache turns each button press into a long stall. Make the cap real
+            // by dropping least-recently-seen entries until back under it. A live row re-resolves
+            // on its next poll, so over-eviction costs one resolve, never correctness.
+            if (_joinCache.Count <= JoinCacheMax) return;
+            var byAge = new List<KeyValuePair<string, WatchSlot>>(_joinCache);
+            byAge.Sort((a, b) => a.Value.LastSeenMs.CompareTo(b.Value.LastSeenMs));
+            int drop = _joinCache.Count - JoinCacheMax;
+            for (int i = 0; i < drop; i++) _joinCache.Remove(byAge[i].Key);
         }
 
         // Small helper for the join endpoints' error responses.
@@ -1344,6 +2390,35 @@ namespace CwsDebug
 
         void IHttpCwsHandler.ProcessRequest(HttpCwsContext context)
         {
+            // Single outermost guard. The individual handlers are careful internally, but the
+            // final Response.Write is a socket write that throws when the client has already gone
+            // away — and at a 250 ms signal-poll cadence a browser being closed or navigated
+            // mid-request is an everyday event, not an edge case. Without this, that ordinary
+            // disconnect escapes into CWS as an unhandled exception from a library callback.
+            try { Route(context); }
+            catch (Exception e)
+            {
+                // Best-effort: the response may already be partly written (or the socket gone),
+                // so both the error reply and the logging are allowed to fail silently. What
+                // matters is that nothing propagates back into the web server.
+                try
+                {
+                    ErrorLog.Error("CwsDebugPage: unhandled error serving \"{0}\": {1}: {2}",
+                        context.Request.Path ?? "?", e.GetType().Name, e.Message);
+                }
+                catch { }
+                try
+                {
+                    context.Response.StatusCode  = 500;
+                    context.Response.ContentType = "application/json";
+                    context.Response.Write("{\"error\":\"internal\"}", true);
+                }
+                catch { }
+            }
+        }
+
+        private void Route(HttpCwsContext context)
+        {
             var path   = context.Request.Path       ?? string.Empty;
             var method = context.Request.HttpMethod ?? "GET";
 
@@ -1361,10 +2436,13 @@ namespace CwsDebug
                 ServeDevices(context);              // registered devices for the watch panel's picker
             else if (path.EndsWith("api/smartobjects", StringComparison.OrdinalIgnoreCase) && method == "GET")
                 ServeSmartObjects(context);         // a smart object's sig names/numbers (discovery)
-            else if (path.EndsWith("api/joins", StringComparison.OrdinalIgnoreCase) && method == "GET")
-                ServeJoins(context);                // watched join values as JSON
+            else if (path.EndsWith("api/joins", StringComparison.OrdinalIgnoreCase)
+                     && (method == "GET" || method == "POST"))
+                ServeJoins(context);                // watched join values as JSON (POST: set in body)
             else if (path.EndsWith("api/join", StringComparison.OrdinalIgnoreCase) && method == "POST")
                 WriteJoin(context);                 // force one join (arm-gated, audited)
+            else if (path.EndsWith("api/press", StringComparison.OrdinalIgnoreCase) && method == "POST")
+                PressJoin(context);                 // simulate panel activity on an In signal (arm-gated, audited)
             else if (path.EndsWith("api/arm", StringComparison.OrdinalIgnoreCase))
                 ServeArm(context, method);          // GET reads / POST sets the force arm gate
             else
@@ -1419,9 +2497,19 @@ namespace CwsDebug
                 lastSeq = _seq;
             }
 
+            // Piggybacked on the log poll rather than given its own endpoint: the page needs to
+            // know whether ANY device is registered so it can show or hide the Signals button,
+            // and that answer can change after the page was served (devices are registered from
+            // InitializeSystem, and a program restart or UnregisterDevice can take them away
+            // again). Riding along here keeps it live at zero extra requests. Taken outside
+            // _lock — which this method holds above — per the ordering invariant.
+            int deviceCount;
+            lock (_devLock) deviceCount = _devices.Count;
+
             var sb = new StringBuilder();
             sb.Append("{\"lastSeq\":");
             sb.Append(lastSeq);
+            sb.Append(",\"devices\":").Append(deviceCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
             sb.Append(",\"entries\":[");
             bool first = true;
             foreach (var e in snapshot)
@@ -1617,10 +2705,21 @@ namespace CwsDebug
             if (string.IsNullOrEmpty(_persistPath)) return;
             try
             {
-                if (!File.Exists(_persistPath)) return;
+                // Fall back through the swap-sequence leftovers (see FlushToDisk): if the live file
+                // is missing, a ".bak" means power was lost mid-swap with the old copy safely
+                // renamed aside, and a ".tmp" means it was lost before the swap even started. Both
+                // are complete files — the swap never leaves a half-written one under either name —
+                // so recovering from them is strictly better than starting with no history.
+                var source = _persistPath;
+                if (!File.Exists(source))
+                {
+                    if (File.Exists(_persistPath + ".bak"))      source = _persistPath + ".bak";
+                    else if (File.Exists(_persistPath + ".tmp")) source = _persistPath + ".tmp";
+                    else return;
+                }
 
                 string content;
-                using (var reader = new StreamReader(_persistPath)) content = reader.ReadToEnd();
+                using (var reader = new StreamReader(source)) content = reader.ReadToEnd();
 
                 var lines  = content.Split('\n');
                 var loaded = new List<LogEntry>(lines.Length);
@@ -1659,34 +2758,58 @@ namespace CwsDebug
         // timer and once more on program stop. Writes to a temp file then swaps it in, so a flush
         // interrupted mid-write cannot corrupt the live file. On any failure the dirty flag is restored
         // so the next tick retries.
+        //
+        // The swap keeps a recoverable copy on disk AT ALL TIMES. The obvious sequence — delete the
+        // live file, then move the temp file onto its name — leaves a window with no log file at
+        // all, and a power cut inside that window loses the entire persisted history (LoadPersisted
+        // would find nothing). Instead the live file is renamed aside to ".bak" first, so every
+        // instant has either the live file or the .bak present, and LoadPersisted falls back to
+        // .bak (then .tmp) when the main file is missing.
+        //
+        // The in-progress flag makes the shutdown flush and a timer tick that is already running
+        // mutually exclusive: both write the same .tmp path, and interleaving them would produce a
+        // torn temp file that then gets promoted to live.
         private void FlushToDisk()
         {
             if (string.IsNullOrEmpty(_persistPath)) return;
-
-            List<LogEntry> snapshot;
-            lock (_lock)
-            {
-                if (!_dirty) return;
-                snapshot = new List<LogEntry>(_log);
-                _dirty   = false;
-            }
-
+            if (System.Threading.Interlocked.Exchange(ref _flushing, 1) == 1) return;   // a flush is already running
             try
             {
-                var sb = new StringBuilder();
-                foreach (var e in snapshot)
-                    sb.Append(e.Level).Append('\t').Append(e.Timestamp).Append('\t')
-                      .Append(Escape(e.Message)).Append('\n');
+                List<LogEntry> snapshot;
+                lock (_lock)
+                {
+                    if (!_dirty) return;
+                    snapshot = new List<LogEntry>(_log);
+                    _dirty   = false;
+                }
 
-                var tmp = _persistPath + ".tmp";
-                using (var writer = new StreamWriter(tmp, false)) writer.Write(sb.ToString());
-                if (File.Exists(_persistPath)) File.Delete(_persistPath);
-                File.Move(tmp, _persistPath);
+                try
+                {
+                    var sb = new StringBuilder();
+                    foreach (var e in snapshot)
+                        sb.Append(e.Level).Append('\t').Append(e.Timestamp).Append('\t')
+                          .Append(Escape(e.Message)).Append('\n');
+
+                    var tmp = _persistPath + ".tmp";
+                    var bak = _persistPath + ".bak";
+                    using (var writer = new StreamWriter(tmp, false)) writer.Write(sb.ToString());
+
+                    // Rename aside rather than delete, so the old copy still exists under a name
+                    // LoadPersisted knows to look for until the new one is safely in place.
+                    if (File.Exists(_persistPath))
+                    {
+                        try { if (File.Exists(bak)) File.Delete(bak); } catch { }
+                        File.Move(_persistPath, bak);
+                    }
+                    File.Move(tmp, _persistPath);
+                    try { if (File.Exists(bak)) File.Delete(bak); } catch { /* stale .bak is harmless */ }
+                }
+                catch
+                {
+                    lock (_lock) _dirty = true;                  // retry on the next tick
+                }
             }
-            catch
-            {
-                lock (_lock) _dirty = true;                      // retry on the next tick
-            }
+            finally { System.Threading.Interlocked.Exchange(ref _flushing, 0); }
         }
 
         // Sets the master logging switch and persists the new state so it survives a restart.
@@ -1907,6 +3030,17 @@ body.light button:hover{background:#d1d5db}
 .addwatch{display:flex;gap:6px;padding:6px 14px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--row-border)}
 .addwatch select,.addwatch input{background:var(--search-bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:4px 6px;font:12px 'Courier New',monospace;outline:none}
 .addwatch input{width:70px}
+.sowrap{position:relative;display:inline-block}
+/* Styled replacement for a native <datalist> (unthemeable, and some browsers render it huge) —
+   same idea, own markup: a scrollable panel under the SO# input, filtered as you type. */
+.somenu{display:none;position:absolute;top:100%;left:0;margin-top:2px;z-index:20;min-width:200px;
+  max-height:220px;overflow-y:auto;background:var(--bg2);border:1px solid var(--border);
+  border-radius:3px;box-shadow:0 4px 12px rgba(0,0,0,.35)}
+.somenu.open{display:block}
+.somenu-item{padding:4px 8px;font:12px 'Courier New',monospace;cursor:pointer;white-space:nowrap;color:var(--text)}
+.somenu-item:hover,.somenu-item.hi{background:var(--border)}
+.somenu-item .n{color:var(--muted);margin-left:6px}
+.somenu-empty{padding:4px 8px;font:12px 'Courier New',monospace;color:var(--muted);font-style:italic}
 .wlist{flex:1;overflow-y:auto}
 .wrow{display:flex;gap:8px;align-items:baseline;padding:4px 14px;border-bottom:1px solid var(--row-border);line-height:1.5}
 .wkey{flex-shrink:0;color:var(--muted);min-width:110px;max-width:160px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1916,6 +3050,12 @@ body.light button:hover{background:#d1d5db}
 .wx{flex-shrink:0;background:transparent;border:1px solid var(--border);color:var(--muted);padding:0 7px;border-radius:2px;cursor:pointer;font:bold 12px 'Courier New',monospace}
 .wx:hover{background:#b91c1c;color:#fff;border-color:#b91c1c}
 .wempty{color:var(--muted);padding:8px 14px;font-style:italic;font-size:12px}
+/* Disarmed still needs to read as ""notice this"", not just another gray button next to Pause
+   and Logging — a dashed amber border keeps it visually distinct without implying danger the
+   way solid red (the armed/active state below) does. */
+/* 2px on both states (not just disarmed) so arming doesn't shift the button's size by a pixel. */
+#armBtn{border-width:2px}
+#armBtn:not(.on){border-style:dashed;border-color:#d97706}
 #armBtn.on{background:#b91c1c;border-color:#b91c1c;color:#fff}
 #armBtn.on:hover{background:#991b1b}
 .wforce{display:flex;gap:4px;flex-shrink:0}
@@ -1942,7 +3082,7 @@ body.light button:hover{background:#d1d5db}
 <header>
   <div class=""brand""><h1>__TITLE__</h1><span class=""ver"">v__VERSION__</span></div>
   <div class=""controls"">
-    <span id=""status"">Loading...</span>
+    <span id=""status"" onclick=""toggleTimeFormat()"" style=""cursor:pointer"" title=""Click to switch between 12-hour and 24-hour time."">Loading...</span>
     <button id=""logBtn"" class=""toggle on"" onclick=""toggleLogging()"" title=""RECORDING switch on the processor: off means nothing is stored (persists across restarts). It does not stop this page updating - use Pause for that."">Logging On</button>
     <button id=""pauseBtn"" class=""toggle"" onclick=""togglePause()"" title=""Stop this page requesting updates. The processor keeps recording; resuming catches up. The page also stops on its own when hidden or left idle."">Pause</button>
     <button id=""appBtn""  class=""toggle on"" onclick=""toggleSource('app')"" title=""Show/hide the program's own log messages."">Debugger</button>
@@ -1968,18 +3108,27 @@ body.light button:hover{background:#d1d5db}
 <div class=""watch"" id=""watchPanel"" style=""display:none"">
   <div class=""addwatch"">
     <span class=""flabel"">Add:</span>
-    <select id=""awDev"" title=""Which registered device the signal belongs to.""></select>
+    <select id=""awDev"" title=""Which registered device the signal belongs to."" onchange=""populateSoList()""></select>
     <select id=""awType"" onchange=""refreshSigOptions()"" title=""Signal type: Digital = true/false, Analog = 0-65535, Serial = text."">
       <option value=""d"">Digital</option>
       <option value=""a"">Analog</option>
       <option value=""s"">Serial</option>
     </select>
-    <select id=""awDir"" title=""Out = to the panel (text/feedback, forceable). In = from the panel (presses, read-only). Both = one row showing both directions of the same join."" onchange=""refreshSigOptions()"">
+    <span class=""sowrap"">
+      <input id=""awSo"" type=""number"" min=""1"" placeholder=""SO#"" autocomplete=""off"" title=""Smart Object ID — leave blank for a panel join. Suggestions (when known) come from the SGD or Construct contract, not typed in by hand.""
+             oninput=""refreshSigOptions();showSoName();renderSoMenu()"" onfocus=""this.select();renderSoMenu(true)"" onblur=""setTimeout(closeSoMenu,150)"" onkeydown=""if(event.key==='Escape')closeSoMenu()"">
+      <div id=""awSoMenu"" class=""somenu""></div>
+    </span>
+    <span id=""awSoName"" style=""color:var(--muted);font-size:12px;align-self:center;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap""></span>
+    <!-- After SO#, not before: whether Both/Out/In are even meaningful choices depends on what
+         the chosen smart object actually has (fillSigOptions may grey Both out entirely, or find
+         nothing on one side) — deciding the SO first, then the direction, matches that dependency
+         instead of asking the direction question before it can really be answered. -->
+    <select id=""awDir"" title=""In = into the panel (text/feedback) — changes what the panel shows. Out = out of the panel (presses) — runs the program's own logic, as if the panel had been used. Both = one row showing both directions of the same join."" onchange=""refreshSigOptions()"">
       <option value=""b"" selected>Both</option>
-      <option value="""">Out</option>
-      <option value=""o"">In</option>
+      <option value="""">In</option>
+      <option value=""o"">Out</option>
     </select>
-    <input id=""awSo"" type=""number"" min=""1"" placeholder=""SO#"" title=""Smart Object ID — leave blank for a panel join"" oninput=""refreshSigOptions()"">
     <select id=""awSig"" style=""display:none;max-width:220px"" title=""Signal inside the smart object, by SGD name"" onchange=""syncJoinBox()""></select>
     <input id=""awJoin"" type=""number"" min=""1"" placeholder=""Join #"" title=""Join number (not needed when a named signal is picked)."">
     <input id=""awName"" type=""text"" placeholder=""Name (opt)"" style=""width:120px"" title=""Optional friendly name shown on the row and in force log entries."">
@@ -2003,7 +3152,31 @@ var LOGGING_ENABLED=__LOGGING__;
 var CLIENT_MAX=__MAXENTRIES__;   // client display cap, matched to the server ring size
 var WATCH_AVAILABLE=__WATCH__;   // true when the host registered at least one device
 var watchOpen=false;
-var watchList=[];                // [{dev,key}] in display order, persisted to localStorage
+var watchList=[];                // [{rid,dev,key,...}] in display order, persisted to localStorage
+// Every row carries an opaque, persisted id, and that id — never (dev,key) — is what the row's
+// buttons act on. (dev,key) is NOT unique: a paired row drops the direction prefix from its key,
+// so it collides with a plain Out row on the same join, and two contract pairs can share an
+// out-side join while differing only in their in-side one. Looking a row up by (dev,key) could
+// therefore rename, un-log, or delete a DIFFERENT row than the one clicked.
+var rowSeq=0;
+function nextRid(){return 'r'+(rowSeq++);}
+// Shows/hides the Signals button to match whether the program currently has any device
+// registered. Registration is the only criterion — an offline panel still has joins worth
+// looking at, and its rows correctly show as stale rather than vanishing. Kept live from the
+// log poll (see refresh) because the page can outlive the state it was rendered with: served
+// before InitializeSystem registered anything, or still open after a restart removed it.
+// Closes the panel on the way out so it cannot be left open over a device list that is gone.
+function setWatchAvailable(avail){
+  if(avail===WATCH_AVAILABLE)return;
+  WATCH_AVAILABLE=avail;
+  var wb=document.getElementById('watchBtn');
+  if(wb)wb.style.display=avail?'':'none';
+  if(!avail&&watchOpen)toggleWatch();
+}
+function findRow(rid){
+  for(var i=0;i<watchList.length;i++) if(watchList[i].rid===rid) return watchList[i];
+  return null;
+}
 var joinVals={};                 // key -> last response entry for that key
 var joinRev=0;                   // api/joins cursor; reset to 0 whenever the watch set changes
 var levelOn={Info:true,Notice:true,Warning:true,Error:true,Fatal:true};
@@ -2042,6 +3215,7 @@ function applyFilter(){
   renderWatch();
 }
 var armed=false, writesAllowed=true;
+var devCanPress={};   // dev name -> whether simulated presses resolved for it on this SDK build
 var editingWatch=null;    // key of an editor mid-edit; blocks re-render so polls can't clobber typing
 var wflash={};            // id -> flash-until timestamp: activity lamp for In-side digitals
 function badgeHtml(j,tip){
@@ -2056,29 +3230,62 @@ function lampHtml(id,j){
 }
 // fb (optional) is the join's own current value: the matching High/Low button is
 // highlighted so the feedback state stays visible without a second TRUE/FALSE badge.
+// In-direction (into the panel) digital controls. Same three actions, same order (Low, Pulse,
+// High - laid out like a rocker, off on the left) as the
+// Out-direction set below, so the two directions read identically — what differs is only what a
+// change reaches, not how you drive it. fb (optional) is the join's own current value: the
+// matching High/Low button is highlighted so the state stays visible without a second badge.
 function forceBtnsHtml(dev,key,fb){
   var on=armed&&writesAllowed;
   var cls=on?'wf':'wf off';
   var lock=on?'':' (arm forcing first)';
   var hi=(fb&&fb.v===true)?' active':'', lo=(fb&&fb.v===false)?' active':'';
+  function b(val,txt,tip,extra){
+    return '<button class=""'+cls+(extra||'')+'"" title=""'+tip+lock+'"" onclick=""forceJoin(\''+escAttr(dev)+'\',\''+escAttr(key)+'\',\''+val+'\')"">'+txt+'</button>';
+  }
   return '<span class=""wforce"">'+
-     '<button class=""'+cls+hi+'"" title=""Force this join high/true'+lock+'"" onclick=""forceJoin(\''+escAttr(dev)+'\',\''+escAttr(key)+'\',\'high\')"">High</button>'+
-     '<button class=""'+cls+lo+'"" title=""Force this join low/false'+lock+'"" onclick=""forceJoin(\''+escAttr(dev)+'\',\''+escAttr(key)+'\',\'low\')"">Low</button>'+
-     '<button class=""'+cls+'"" title=""Momentary: high then immediately low'+lock+'"" onclick=""forceJoin(\''+escAttr(dev)+'\',\''+escAttr(key)+'\',\'pulse\')"">Pulse</button>'+
+     b('low','Low','Hold this join low/false',lo)+
+     b('pulse','Pulse','Momentary: high then immediately low')+
+     b('high','High','Hold this join high/true',hi)+
      '</span>';
 }
-function editorHtml(e,j,key){
-  var canForce=armed&&writesAllowed;
+// inject=false: the editor forces the value (Out/input sig). inject=true: it SIMULATES the panel
+// sending that value on a read-only In sig, so the program's handlers run (analog/serial twin of
+// the digital Press buttons). The only differences are which capability gates it and which
+// endpoint the Enter key hits — everything else about the cell is identical.
+function editorHtml(e,j,key,inject){
+  var canForce=armed&&writesAllowed&&(!inject||devCanPress[e.dev]);
   var num=j.t==='a';
+  var verb=inject?'send it as a panel input':'force it';
   return '<input class=""'+(num?'wnum':'wtxt')+'"" type=""'+(num?'number':'text')+'""'+
      (num?' min=""0"" max=""65535""':'')+
-     ' title=""'+(canForce?'Type a value and press Enter to force it. Esc cancels.':'Read-only until forcing is armed.')+'""'+
+     ' title=""'+(canForce?('Type a value and press Enter to '+verb+'. Esc cancels.'):'Read-only until forcing is armed.')+'""'+
      ' value=""'+escq(j.v)+'""'+
      (canForce?'':' readonly')+
      ' onfocus=""editingWatch=\''+escAttr(e.dev+'|'+key)+'\'""'+
      ' onblur=""editingWatch=null;renderWatch()""'+
      ' oninput=""this.classList.add(\'dirty\')""'+
-     ' onkeydown=""'+(num?'analogKey':'serialKey')+'(event,\''+escAttr(e.dev)+'\',\''+escAttr(key)+'\',this)"">';
+     ' onkeydown=""'+(num?'analogKey':'serialKey')+'(event,\''+escAttr(e.dev)+'\',\''+escAttr(key)+'\',this,'+(inject?'true':'false')+')"">';
+}
+// Out-direction (out of the panel) digital controls: same Pulse / High / Low as the In direction,
+// deliberately identical so the two read the same way. What differs is the effect — driving this
+// side runs the program's own SigChange handlers and Construct contract events, exactly as if the
+// panel had been used. Gated on the same arm + writes-allowed as the In direction, plus the
+// mechanism having resolved on this SDK build.
+function pressBtnsHtml(dev,key,fb){
+  if(!devCanPress[dev])return '';
+  var on=armed&&writesAllowed;
+  var cls=on?'wf':'wf off';
+  var lock=on?'':' (arm forcing first)';
+  var hi=(fb&&fb.v===true)?' active':'', lo=(fb&&fb.v===false)?' active':'';
+  function b(act,txt,tip,extra){
+    return '<button class=""'+cls+(extra||'')+'"" title=""'+tip+lock+'"" onclick=""pressJoin(\''+escAttr(dev)+'\',\''+escAttr(key)+'\',\''+act+'\')"">'+txt+'</button>';
+  }
+  return '<span class=""wforce"">'+
+     b('low','Low','Return low, as releasing a held press',lo)+
+     b('pulse','Pulse','Momentary, as a quick tap on the panel: high then immediately low')+
+     b('high','High','Hold high, as a press-and-hold on the panel',hi)+
+     '</span>';
 }
 // Renders one direction's value/editor cell. Digitals: one badge; In-side gets the
 // activity lamp instead of a counter. Analog/serial: value or editor, no counters.
@@ -2088,11 +3295,15 @@ function watchCell(e,j,key){
   var h='';
   if(j.t==='d'){
     h+=badgeHtml(j)+lampHtml(e.dev+'|'+key,j);
-    if(!j.ro)h+=forceBtnsHtml(e.dev,key,j);
+    if(!j.ro)h+=forceBtnsHtml(e.dev,key,j);    // In: changes what the panel shows
+    else h+=pressBtnsHtml(e.dev,key,j);        // Out: runs the program's logic
   }else if(j.ro){
-    h+='<span class=""wval"" title=""'+escq(j.v)+'"">'+esc(String(j.v))+'</span>';
+    // In analog/serial: show the value, and when presses are available offer an editor that
+    // sends it as panel input (the analog/serial equivalent of a press).
+    if(devCanPress[e.dev]&&armed&&writesAllowed) h+=editorHtml(e,j,key,true);
+    else h+='<span class=""wval"" title=""'+escq(j.v)+'"">'+esc(String(j.v))+'</span>';
   }else{
-    h+=editorHtml(e,j,key);
+    h+=editorHtml(e,j,key,false);
   }
   if(j.ferr)h+='<span class=""wferr"">'+esc(j.ferr)+'</span>';
   return h;
@@ -2108,10 +3319,10 @@ function renderWatch(){
     var row=document.createElement('div');
     row.className='wrow';
     var label=e.label||(e.dev+' '+e.key);
-    var h='<span class=""wkey"" title=""'+escq(e.dev+' '+e.key+(e.pair?' + '+oKey(e.key):'')+' — double-click to rename')+'""'+
-          ' ondblclick=""renameWatch(\''+escAttr(e.dev)+'\',\''+escAttr(e.key)+'\')"">'+esc(label)+'</span>';
+    var h='<span class=""wkey"" title=""'+escq(e.dev+' '+e.key+(e.pair?' + '+pairInKey(e):'')+' — double-click to rename')+'""'+
+          ' ondblclick=""renameWatch(\''+escAttr(e.rid)+'\')"">'+esc(label)+'</span>';
     if(e.pair){
-      var jo=joinVals[e.dev+'|'+oKey(e.key)];
+      var jo=joinVals[e.dev+'|'+pairInKey(e)];
       if(j&&!j.err&&j.t==='d'){
         // Paired digital: ONE state indicator — the Out (feedback) side, which is what the
         // force buttons drive and what lights on the panel — plus the activity lamp, which
@@ -2120,22 +3331,22 @@ function renderWatch(){
         // the badge is the sampled value, so a pulse flashes the lamp without flipping it.
         // Feedback state shows as the highlighted High/Low button instead.
         h+=forceBtnsHtml(e.dev,e.key,j);
-        if(jo&&!jo.err)h+=badgeHtml(jo,'Panel press state')+lampHtml(e.dev+'|'+oKey(e.key),jo);
+        if(jo&&!jo.err)h+=badgeHtml(jo,'Panel press state')+lampHtml(e.dev+'|'+pairInKey(e),jo);
         else if(jo&&jo.err)h+='<span class=""werr"">'+esc(jo.err)+'</span>';
         else h+='<span class=""wval"" style=""color:var(--muted)"">&mdash;</span>';
         if(j.ferr)h+='<span class=""wferr"">'+esc(j.ferr)+'</span>';
       }else{
-        // No direction labels: the editable cell is always the to-panel (Out) side and the
-        // plain-text cell the from-panel (In) side; the row tooltip carries both keys.
+        // No direction labels: the editable cell is always the into-panel (In) side and the
+        // plain-text cell the out-of-panel (Out) side; the row tooltip carries both keys.
         h+=watchCell(e,j,e.key);
-        h+=watchCell(e,jo,oKey(e.key));
+        h+=watchCell(e,jo,pairInKey(e));
       }
     }else{
       h+=watchCell(e,j,e.key);
     }
     h+='<span style=""flex:1""></span>';
     h+=traceBtnHtml(e);
-    h+='<button class=""wx"" title=""Remove this signal from the list."" onclick=""removeWatch(\''+escAttr(e.dev)+'\',\''+escAttr(e.key)+'\')"">&times;</button>';
+    h+='<button class=""wx"" title=""Remove this signal from the list."" onclick=""removeWatch(\''+escAttr(e.rid)+'\')"">&times;</button>';
     row.innerHTML=h;
     el.appendChild(row);
   });
@@ -2176,11 +3387,51 @@ function fillSigOptions(d){
   var dirSel=document.getElementById('awDir');
   var bothOpt=dirSel.options[0];
   var type=document.getElementById('awType').value;
-  var ins=(d.sigs[{d:'din',a:'ain',s:'sin'}[type]])||[];      // to-panel  (UI ""Out"")
-  var outs=(d.sigs[{d:'dout',a:'aout',s:'sout'}[type]])||[];  // from-panel (UI ""In"")
-  var outByNum={};
-  outs.forEach(function(s){outByNum[s.n]=s.name||('#'+s.n);});
-  var pairable=ins.filter(function(s){return outByNum.hasOwnProperty(s.n);});
+  var ins=(d.sigs[{d:'din',a:'ain',s:'sin'}[type]])||[];      // into the panel  (UI ""In"")
+  var outs=(d.sigs[{d:'dout',a:'aout',s:'sout'}[type]])||[];  // out of the panel (UI ""Out"")
+  // s.friendly (contract manifests only) is a nicer DISPLAY label than the SDK's own s.name —
+  // e.g. Left instead of CH5's generic Bool Sig Number 5. Addressing is always by NUMBER (see
+  // the non-Both branch below), so friendly never touches what a row actually resolves against,
+  // only what it's labeled.
+  var disp=function(s){return s.friendly||s.name||('#'+s.n);};
+  // Every pairing rule below produces the same shape: {outNum, inNum, label}. outNum is the
+  // forceable (state) side driving the row's force buttons; inNum is the read-only (event)
+  // side driving its activity lamp — they are the SAME number for an SGD panel's true In/Out
+  // pair, but can be TWO DIFFERENT numbers for a contract pair (see Rule B), which is exactly
+  // why this is a number pair and not a single shared address.
+  var pairable=[];
+  if(d.contract){
+    // A contract's states and events are numbered by two INDEPENDENT counters, so a shared
+    // NUMBER between them is coincidence, not a pairing (confirmed on a real manifest: join
+    // 1005 is both a button's Enabled STATE and a DIFFERENT button's press EVENT) — so numeric
+    // matching is never used here. Two rules that hold by NAME instead:
+    //   Rule A — a state and an event with the IDENTICAL full name are the same control shown
+    //            from its two directions (e.g. a Visible state that is also echoed as an event).
+    //   Rule B — within one repeated item (paths sharing a leading ""Word+digits"" token, e.g.
+    //            ""Button5""), a *Press event pairs with that same item's *Selected state — the
+    //            momentary press and the item's selected/toggled condition, shown on one row.
+    outs.forEach(function(so){
+      var si=ins.find(function(s){return disp(s)===disp(so);});
+      if(si) pairable.push({outNum:si.n,inNum:so.n,label:disp(si)});
+    });
+    var group=function(s){var m=/^([A-Za-z]+\d+)/.exec(disp(s));return m?m[1]:null;};
+    var byGroup={};
+    ins.forEach(function(s){var g=group(s);if(g)(byGroup[g]=byGroup[g]||{ins:[],outs:[]}).ins.push(s);});
+    outs.forEach(function(s){var g=group(s);if(g)(byGroup[g]=byGroup[g]||{ins:[],outs:[]}).outs.push(s);});
+    Object.keys(byGroup).forEach(function(g){
+      var grp=byGroup[g];
+      var selected=grp.ins.filter(function(s){return /selected$/i.test(disp(s));});
+      var press=grp.outs.filter(function(s){return /press$/i.test(disp(s));});
+      if(selected.length===1&&press.length===1)
+        pairable.push({outNum:selected[0].n,inNum:press[0].n,label:g});
+    });
+  }else{
+    var outByNum={};
+    outs.forEach(function(s){outByNum[s.n]=disp(s);});
+    ins.filter(function(s){return outByNum.hasOwnProperty(s.n);}).forEach(function(s){
+      pairable.push({outNum:s.n,inNum:s.n,label:disp(s)+' / '+outByNum[s.n]});
+    });
+  }
 
   if(bothOpt&&bothOpt.value==='b'){
     if(pairable.length){bothOpt.disabled=false;bothOpt.textContent='Both';}
@@ -2192,14 +3443,18 @@ function fillSigOptions(d){
   var dir=dirSel.value;
   var list=[];
   if(dir==='b'){
-    // Paired rows address the SHARED NUMBER: the two halves have different names, so a
-    // name can only ever resolve one side of the pair.
-    list=pairable.map(function(s){
-      return {v:String(s.n),t:(s.name||('#'+s.n))+' / '+outByNum[s.n]+' ('+s.n+')'};
+    // Value carries BOTH numbers (outNum~inNum) since a contract pair (Rule B) can legitimately
+    // be two different joins — addWatch splits this back apart.
+    list=pairable.map(function(p){
+      return {v:p.outNum+'~'+p.inNum,t:p.label+(p.outNum===p.inNum?' ('+p.outNum+')':' ('+p.outNum+'/'+p.inNum+')')};
     });
   }else{
+    // Value is the NUMBER, never the name: CH5's smart objects (unlike an SGD-loaded one)
+    // don't support by-name sig lookup at all, so a name-addressed key on one of them is a
+    // permanent resolution error no matter how it's spelled. Numbers work identically for
+    // both, so there is no reason to ever depend on name-lookup succeeding.
     list=(dir===''?ins:outs).filter(function(s){return s.name;})
-      .map(function(s){return {v:s.name,t:s.name+' ('+s.n+')'};});
+      .map(function(s){return {v:String(s.n),t:disp(s)+' ('+s.n+')'};});
   }
   sel.innerHTML='';
   // Nothing of this type/direction on the object: hide the picker rather than offer an
@@ -2228,12 +3483,13 @@ function setDevOnline(dev,online){
 function b64url(s){
   return btoa(unescape(encodeURIComponent(s))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 }
-function serialKey(ev,dev,key,input){
+function serialKey(ev,dev,key,input,inject){
   if(ev.key==='Escape'){editingWatch=null;input.blur();return;}
   if(ev.key!=='Enter')return;
   input.classList.remove('dirty');input.classList.add('pending');input.readOnly=true;
   editingWatch=null;
-  forceJoin(dev,key,'b64:'+b64url(input.value));
+  var v='b64:'+b64url(input.value);
+  if(inject)pressJoin(dev,key,'send',v);else forceJoin(dev,key,v);
   input.blur();
 }
 var lastTouch=0;
@@ -2262,15 +3518,16 @@ function pollSignals(){
   watchList.forEach(function(e){
     var arr=(byDev[e.dev]=byDev[e.dev]||[]);
     arr.push(e.key);
-    if(e.pair)arr.push(oKey(e.key));               // paired rows read both directions
+    if(e.pair)arr.push(pairInKey(e));               // paired rows read both directions
     if(e.trace){
       // ""key"" or ""key:<base64url label>"" - the name shown on the row travels with it so the
       // log reads in the same terms, and base64url keeps a comma or colon in a name from
-      // breaking the list.
+      // breaking the list. Key and label are kept apart here so the label can be dropped if
+      // the composed URL would get too long (see below).
       var tr=(trcDev[e.dev]=trcDev[e.dev]||[]);
       var sfx=e.label?':'+b64url(e.label):'';
-      tr.push(e.key+sfx);
-      if(e.pair)tr.push(oKey(e.key)+sfx);          // a traced pair logs both halves
+      tr.push({k:e.key,s:sfx});
+      if(e.pair)tr.push({k:pairInKey(e),s:sfx});    // a traced pair logs both halves
     }
   });
   var devs=Object.keys(byDev);
@@ -2278,8 +3535,15 @@ function pollSignals(){
   var changed=false, flashed=false;
   devs.forEach(function(dev){
     var trc=trcDev[dev];
-    fetch('api/joins?since='+joinRev+'&dev='+encodeURIComponent(dev)+'&w='+encodeURIComponent(byDev[dev].join(','))+
-          (trc?'&t='+encodeURIComponent(trc.join(',')):''))
+    // POST, not GET: the whole watch set AND the whole traced set (with their names) are re-sent
+    // on every poll — that repetition is what makes tracing lapse by itself when this page goes
+    // away — so with dozens of logged signals this payload is far too big to keep pushing through
+    // a URL. In a body it has no practical size limit, so the list can grow to the server's own
+    // key cap without the request itself ever becoming the constraint. The w/t strings are
+    // formatted exactly as the query-string form, so the server parses both identically.
+    fetch('api/joins',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({since:joinRev,dev:dev,w:byDev[dev].join(','),
+        t:trc?trc.map(function(t){return t.k+t.s;}).join(','):''})})
       .then(function(r){return r.json();}).then(function(d){
         if(d.joins&&d.joins.length){
           d.joins.forEach(function(j){
@@ -2305,6 +3569,7 @@ function pollSignals(){
         }
         if(typeof d.lastRev==='number'&&d.lastRev>joinRev) joinRev=d.lastRev;
         if(typeof d.armed==='boolean') syncArm(d.armed,d.writesAllowed!==false);
+        if(typeof d.canPress==='boolean') devCanPress[dev]=d.canPress;
         if(typeof d.online==='boolean') setDevOnline(dev,d.online);
       }).catch(function(){}).then(function(){
         if(--signalsInFlight>0)return;
@@ -2360,7 +3625,7 @@ function forceJoin(dev,key,val){
       renderWatch();   // rebuild the row so a pending/readonly editor never sticks
     });
 }
-function analogKey(ev,dev,key,input){
+function analogKey(ev,dev,key,input,inject){
   if(ev.key==='Escape'){editingWatch=null;input.blur();return;}
   if(ev.key!=='Enter')return;
   var raw=input.value.trim();
@@ -2368,8 +3633,36 @@ function analogKey(ev,dev,key,input){
   if(!(n>=0&&n<=65535)){input.classList.add('dirty');return;}
   input.classList.remove('dirty');input.classList.add('pending');input.readOnly=true;
   editingWatch=null;
-  forceJoin(dev,key,String(n));
+  if(inject)pressJoin(dev,key,'send',String(n));else forceJoin(dev,key,String(n));
   input.blur();
+}
+// Simulate panel activity on a read-only In signal so the program's handlers run. Arm-gated the
+// same as forcing; the server audits every attempt. A digital act is press|release|tap (no value);
+// analog/serial use act 'send' with a value.
+function pressJoin(dev,key,act,val){
+  if(!(armed&&writesAllowed)){setStatus('Arm forcing first (Disarmed button)');return;}
+  if(!devCanPress[dev]){setStatus('Signal simulation is not available for this device');return;}
+  var id=dev+'|'+key;
+  var lbl=watchLabel(dev,key);
+  var u='api/press?dev='+encodeURIComponent(dev)+'&k='+encodeURIComponent(key)+'&act='+encodeURIComponent(act)+
+        (val!=null?'&v='+encodeURIComponent(val):'')+(lbl?'&n='+encodeURIComponent(lbl):'');
+  fetch(u,{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+    var j=joinVals[id];
+    if(d.ok){
+      // The effect is the program's logic running, not a value this call returns; the next poll
+      // reflects any resulting signal changes. Just clear any prior error and refresh soon.
+      if(j)delete j.ferr;
+      renderWatch();
+      pollSignals();
+    }else if(j){
+      j.ferr=d.error||'rejected';
+      renderWatch();
+      setTimeout(function(){if(joinVals[id]===j){delete j.ferr;renderWatch();}},4000);
+    }
+  }).catch(function(){
+    setStatus('Press failed: connection error');
+    renderWatch();
+  });
 }
 function escAttr(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,'\\\'').replace(/""/g,'&quot;').replace(/</g,'&lt;');}
 // plain HTML-attribute escaping (value="", title="") — escAttr is ONLY for JS strings inside handlers
@@ -2382,27 +3675,37 @@ function traceBtnHtml(e){
   var tip=e.trace?'Logging every change of this signal. Click to stop.'
                  :'Log every change of this signal, without adding anything to the program.';
   return '<button class=""wt'+(e.trace?' on':'')+'"" title=""'+tip+'"" onclick=""toggleTrace('+
-         jsq(e.dev)+','+jsq(e.key)+')"">Log</button>';
+         jsq(e.rid)+')"">Log</button>';
 }
 function jsq(v){return ""'""+escAttr(v)+""'"";}
-function toggleTrace(dev,key){
-  for(var i=0;i<watchList.length;i++){
-    var e=watchList[i];
-    if(e.dev===dev&&e.key===key){
-      if(e.trace)delete e.trace;else e.trace=true;
-      saveWatch();renderWatch();pollSignals();
-      return;
-    }
+function toggleTrace(rid){
+  var e=findRow(rid);
+  if(e){
+    if(e.trace)delete e.trace;else e.trace=true;
+    saveWatch();renderWatch();pollSignals();
   }
 }
-// UI direction convention (system-centric, per user preference): ""Out"" = the program's
-// output TO the panel (API InputSig — text/feedback, forceable); ""In"" = coming in FROM
-// the panel (API OutputSig — presses, read-only). The wire keys keep the API's 'o' prefix.
+// UI direction convention (PANEL-centric, matching the Crestron API and Toolbox):
+//   ""In""  = going IN to the panel   (API InputSig  — text/feedback). Changes what the panel
+//            SHOWS and nothing else.
+//   ""Out"" = coming OUT of the panel (API OutputSig — presses). Drives the program's own
+//            SigChange handlers and Construct contract events, so it changes what the system
+//            DOES (and whatever UI the program updates in response).
+// Both directions are settable and both use the same Pulse / High / Low controls; the difference
+// is what a change reaches, not whether it can be changed.
+// This deliberately matches the API's own naming, so the wire keys line up with the labels: the
+// 'o' prefix (od5) is the OUTPUT sig, which is the side now labelled ""Out"".
 function oKey(k){
-  // d5 -> od5, so1.d3 -> so1.od3 : the from-panel twin of a to-panel key
+  // d5 -> od5, so1.d3 -> so1.od3 : the Out (out-of-panel) twin of an In key, SAME number.
   var i=k.indexOf('.');
   return i>=0?k.substring(0,i+1)+'o'+k.substring(i+1):'o'+k;
 }
+// The in-side (read-only) key for a paired row. Almost always the same number as the out
+// side (oKey derives it by string surgery alone) — except a contract name-based pair (see
+// fillSigOptions' Rule B: an ...Press event combined with an unrelated-numbered ...Selected
+// state) genuinely lives at a DIFFERENT join, so addWatch stores that explicit key on the row
+// as e.key2 and this just prefers it when present. Nothing else needs to know the difference.
+function pairInKey(e){return e.key2||oKey(e.key);}
 function addWatch(){
   var dev=document.getElementById('awDev').value;
   var type=document.getElementById('awType').value;
@@ -2415,25 +3718,53 @@ function addWatch(){
   if(!dev)return;
   if(so&&!(parseInt(so,10)>0))return;
   var pair=dir==='b';
-  var addr='', autoName='';
+  var addr='', autoName='', inAddr='';
   if(so&&pair){
-    // paired SO row: the picker's value is the SHARED NUMBER (see fillSigOptions)
-    if(sigVal){addr=sigVal;autoName=sigSel.options[sigSel.selectedIndex].textContent;}
-    else if(join&&parseInt(join,10)>0){addr=join;}
+    // Paired SO row: the picker's value is ""outNum~inNum"" (see fillSigOptions) — the same
+    // number on both sides for an SGD panel's true In/Out pair, or two different numbers for
+    // a contract's name-matched pair (Rule A/B there). Falling back to the Join# box only
+    // supports the same-number case, same as before — a name-picked contract combo is the
+    // only way to get differing numbers, so there is nothing to type manually for that.
+    if(sigVal){
+      var parts=sigVal.split('~');
+      addr=parts[0];inAddr=parts[1];
+      autoName=sigSel.options[sigSel.selectedIndex].textContent;
+    }
+    else if(join&&parseInt(join,10)>0){addr=join;inAddr=join;}
     else return;
   }else if(so&&sigVal){
-    addr='~'+sigVal;autoName=sigVal;                     // named SO sig
+    // sigVal is now the NUMBER (see fillSigOptions) — resolution is always by join number;
+    // the option's text (SDK name, or the contract's friendlier name when known) becomes this
+    // row's label, prefixed with the smart object's own name when one is known (""Dpad - Left""
+    // rather than a bare ""Left"" that gives no hint which control it came from).
+    addr=sigVal;
+    var soHit=currentDeviceSoIds().find(function(x){return String(x.id)===so;});
+    autoName=(soHit&&soHit.name?soHit.name+' - ':'')+sigSel.options[sigSel.selectedIndex].textContent;
   }else{
     if(!join||!(parseInt(join,10)>0))return;             // plain join number
     addr=join;
   }
-  var key=(so?'so'+so+'.':'')+(pair?'':dir)+type+addr;   // pair rows store the to-panel key
+  var key=(so?'so'+so+'.':'')+(pair?'':dir)+type+addr;   // pair rows store the In (into-panel) key
   if(!name&&autoName)name=autoName;                      // a picked sig name is its own friendly name
-  for(var i=0;i<watchList.length;i++)
-    if(watchList[i].dev===dev&&watchList[i].key===key&&!!watchList[i].pair===pair)return;
-  var e={dev:dev,key:key};
-  if(pair)e.pair=true;
+  var e={dev:dev,key:key,trace:true};   // Log defaults on for a newly added row
+  if(pair){
+    e.pair=true;
+    // Only stored when it differs from the plain oKey() derivation — a same-number pair (every
+    // SGD row, and a contract Rule A match) leaves this unset and pairInKey() falls back to
+    // oKey() exactly as before; only a genuinely different-numbered contract Rule B combo needs
+    // its own explicit in-side key.
+    if(inAddr&&inAddr!==addr) e.key2=(so?'so'+so+'.':'')+'o'+type+inAddr;
+  }
+  // The in-side key is part of a row's identity, not just its display: two different contract
+  // pairs can share an out-side join and differ only on the in side (one control's state and
+  // another's event landing on the same number is a documented real case), so comparing
+  // (dev,key,pair) alone would silently swallow the second one as a duplicate.
+  for(var i=0;i<watchList.length;i++){
+    var x=watchList[i];
+    if(x.dev===dev&&x.key===key&&!!x.pair===pair&&(!pair||pairInKey(x)===pairInKey(e)))return;
+  }
   if(name)e.label=name;
+  e.rid=nextRid();
   watchList.push(e);
   document.getElementById('awName').value='';
   saveWatch();
@@ -2441,22 +3772,21 @@ function addWatch(){
   renderWatch();
   pollSignals();
 }
-function renameWatch(dev,key){
-  for(var i=0;i<watchList.length;i++){
-    var e=watchList[i];
-    if(e.dev===dev&&e.key===key){
-      var n=prompt('Name for '+dev+' '+key+':',e.label||'');
-      if(n===null)return;
-      n=n.trim();
-      if(n)e.label=n;else delete e.label;
-      saveWatch();renderWatch();
-      return;
-    }
-  }
+function renameWatch(rid){
+  var e=findRow(rid);
+  if(!e)return;
+  var n=prompt('Name for '+e.dev+' '+e.key+':',e.label||'');
+  if(n===null)return;
+  n=n.trim();
+  if(n)e.label=n;else delete e.label;
+  saveWatch();renderWatch();
 }
-function removeWatch(dev,key){
-  watchList=watchList.filter(function(e){return !(e.dev===dev&&e.key===key);});
-  delete joinVals[dev+'|'+key];
+function removeWatch(rid){
+  var e=findRow(rid);
+  if(!e)return;
+  watchList=watchList.filter(function(x){return x.rid!==rid;});
+  delete joinVals[e.dev+'|'+e.key];
+  if(e.pair)delete joinVals[e.dev+'|'+pairInKey(e)];   // a pair caches BOTH halves
   saveWatch();
   renderWatch();
 }
@@ -2504,20 +3834,64 @@ function watchLabel(dev,key){
   }
   return '';
 }
+var devicesCache=[];   // last api/devices response; feeds the SO#-suggestion datalist
 function loadDevices(){
   // refetched on every panel open (not cached) so the online/offline label stays honest;
   // the user's selection is preserved across the refresh
   fetch('api/devices').then(function(r){return r.json();}).then(function(d){
+    devicesCache=d.devices||[];
     var sel=document.getElementById('awDev');
     var prev=sel.value;
     sel.innerHTML='';
-    (d.devices||[]).forEach(function(dv){
+    devicesCache.forEach(function(dv){
       var o=document.createElement('option');
       o.value=dv.name;o.textContent=dv.name+(dv.online===false?' (offline)':'');
       sel.appendChild(o);
     });
     if(prev)sel.value=prev;
+    populateSoList();
   }).catch(function(){});
+}
+// Suggestions only — so8.od5 still resolves by number even for an unlisted or unnamed SO.
+// Names come from whichever of RegisterDevice's sgdPath or RegisterContract's manifest the
+// host program supplied; a device registered with neither just offers bare numbers, and the
+// menu stays empty (renderSoMenu below just shows nothing rather than an empty popup).
+function populateSoList(){ closeSoMenu(); showSoName(); }
+function currentDeviceSoIds(){
+  var dev=devicesCache.find(function(dv){return dv.name===document.getElementById('awDev').value;});
+  return (dev&&dev.soIds)||[];
+}
+function showSoName(){
+  var so=document.getElementById('awSo').value.trim();
+  var span=document.getElementById('awSoName');
+  var hit=so&&currentDeviceSoIds().find(function(s){return String(s.id)===so;});
+  span.textContent=hit&&hit.name?hit.name:'';
+}
+// Own scrollable dropdown instead of a native <datalist> — datalist popups can't be themed and
+// on some browsers render far larger than the input they belong to. Filters as you type: a
+// digit-only entry matches by ID prefix, anything else matches the name (so typing ""dpad""
+// finds SO 8 without knowing its number).
+// forceAll=true (on focus) always shows the whole list regardless of what's already typed —
+// re-opening the box to pick a DIFFERENT SO shouldn't start pre-filtered down to the one
+// already chosen. Typing after that still filters normally via oninput's own call.
+function renderSoMenu(forceAll){
+  var q=forceAll?'':document.getElementById('awSo').value.trim().toLowerCase();
+  var all=currentDeviceSoIds();
+  var list=!q?all:all.filter(function(s){
+    return String(s.id).indexOf(q)===0||(s.name||'').toLowerCase().indexOf(q)>=0;
+  });
+  var menu=document.getElementById('awSoMenu');
+  if(!all.length){menu.classList.remove('open');menu.innerHTML='';return;}
+  menu.innerHTML=list.length?list.map(function(s){
+    return '<div class=""somenu-item"" onmousedown=""pickSo('+s.id+')"">'+s.id+
+      (s.name?'<span class=""n"">'+esc(s.name)+'</span>':'')+'</div>';
+  }).join(''):'<div class=""somenu-empty"">No match</div>';
+  menu.classList.add('open');
+}
+function closeSoMenu(){document.getElementById('awSoMenu').classList.remove('open');}
+function pickSo(id){
+  document.getElementById('awSo').value=id;
+  closeSoMenu();showSoName();refreshSigOptions();
 }
 var needRender=false;  // persists across polls: set when data changes, cleared only by a render.
                        // If one fetch of a poll succeeds (appending entries / advancing lastSeq)
@@ -2533,6 +3907,7 @@ function refresh(){
       if(debuggerEntries.length>CLIENT_MAX) debuggerEntries=debuggerEntries.slice(debuggerEntries.length-CLIENT_MAX);
     }
     if(typeof d.lastSeq==='number') lastSeq=d.lastSeq;
+    if(typeof d.devices==='number') setWatchAvailable(d.devices>0);
   })];
   if(showProc) tasks.push(fetch('api/errorlog').then(function(r){return r.json();}).then(function(d){
     var next=d.entries||[];
@@ -2544,9 +3919,25 @@ function refresh(){
   }));
   Promise.all(tasks).then(function(){
     if(needRender){applyFilter();needRender=false;}
-    var note=LOGGING_ENABLED?'':'  — LOGGING OFF';
-    document.getElementById('status').textContent='Updated '+new Date().toLocaleTimeString()+note;
+    renderStatus();
   }).catch(function(){document.getElementById('status').textContent='Connection error';});
+}
+var time12h=true;   // persisted; the header ""Updated"" clock only — log-entry timestamps are
+                    // left as the server's own fixed format, which is unambiguous either way.
+function formatTime(d){
+  var h=d.getHours(),m=pad(d.getMinutes()),s=pad(d.getSeconds());
+  if(!time12h) return pad(h)+':'+m+':'+s;
+  var ap=h<12?'AM':'PM'; h=h%12; if(h===0)h=12;
+  return h+':'+m+':'+s+' '+ap;
+}
+function renderStatus(){
+  var note=LOGGING_ENABLED?'':'  — LOGGING OFF';
+  document.getElementById('status').textContent='Updated '+formatTime(new Date())+note;
+}
+function toggleTimeFormat(){
+  time12h=!time12h;
+  try{localStorage.setItem('dbg-time-12h',time12h?'1':'0');}catch(x){}
+  renderStatus();
 }
 function clearLogs(){
   fetch('api/clear',{method:'POST'}).then(function(){debuggerEntries=[];applyFilter();});
@@ -2668,6 +4059,7 @@ function toggleLogging(){
     }
     var a=localStorage.getItem('dbg-show-app');  if(a!==null) showApp=a==='1';
     var p=localStorage.getItem('dbg-show-proc'); if(p!==null) showProc=p==='1';
+    var t12=localStorage.getItem('dbg-time-12h'); if(t12!==null) time12h=t12==='1';
     var lv=localStorage.getItem('dbg-levels');
     if(lv){var s=JSON.parse(lv);for(var k in s){if(levelOn.hasOwnProperty(k))levelOn[k]=s[k];}}
   }catch(x){}
@@ -2684,6 +4076,15 @@ function toggleLogging(){
       var wl=localStorage.getItem('dbg-watchlist');
       if(wl){var arr=JSON.parse(wl);if(Object.prototype.toString.call(arr)==='[object Array]')
         watchList=arr.filter(function(e){return e&&typeof e.dev==='string'&&typeof e.key==='string';});}
+      // Rows saved before row ids existed have none: give them one now, and start the counter
+      // past anything already in use so a reload can never reissue a live id.
+      watchList.forEach(function(e){
+        if(typeof e.rid==='string'){
+          var n=parseInt(e.rid.substring(1),10);
+          if(n>=rowSeq)rowSeq=n+1;
+        }
+      });
+      watchList.forEach(function(e){if(typeof e.rid!=='string')e.rid=nextRid();});
       var ww=parseInt(localStorage.getItem('dbg-watch-w')||'',10);
       if(ww>=280)document.getElementById('watchPanel').style.width=ww+'px';
       if(localStorage.getItem('dbg-watch-open')==='1'){
