@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.5.0
+//  Version:  1.5.1
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -213,7 +213,7 @@ namespace CwsDebug
         // the page's own version string proves exactly which build is on the processor. A
         // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
         // release time, same as every other version-bump-in-3-places step.
-        private const string Version = "1.5.0";
+        private const string Version = "1.5.1";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
