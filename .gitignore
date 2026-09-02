@@ -16,6 +16,7 @@
 
 # Generated documentation (kept local only)
 CwsDebug_Documentation.html
+CwsDebug_GettingStarted.html
 debugger_screenshot.png
 
 # Release artifacts (published via GitHub Releases, not committed)
