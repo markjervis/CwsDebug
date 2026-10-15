@@ -3,6 +3,19 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.2] - 2026-10-15
+
+### Fixed
+- **Full signal names on hover.** Names in the Signals panel are clipped to the column width,
+  so similar ones (`Main.HButtonList - Li…`, `Main.HButtonList - Bu…`) couldn't be told apart.
+  Hovering a name now shows the full name first, then its device and signal keys, then the
+  rename hint.
+- **Log readable on phones and narrow windows.** The timestamp kept its full width while the
+  message shrank, so on a narrow screen (especially with the Signals panel open) messages
+  wrapped one character per line. The timestamp now drops to its own line when space runs out,
+  the header buttons wrap instead of running off the screen, and at 760px wide or less the
+  Signals panel stacks above the log instead of beside it. Desktop layout is unchanged.
+
 ## [1.6.1] - 2026-10-15
 
 ### Fixed
