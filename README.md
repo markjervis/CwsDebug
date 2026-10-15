@@ -364,8 +364,11 @@ dotnet build CwsDebug/CwsDebug.csproj -c Release
 
 ## Documentation
 
-A formatted reference is included: [`CwsDebug_Documentation.pdf`](CwsDebug_Documentation.pdf).
-Release history is tracked in [`CHANGELOG.md`](CHANGELOG.md).
+New to the library? Start with
+[`CwsDebug_GettingStarted.pdf`](CwsDebug_GettingStarted.pdf) — a step-by-step walkthrough of
+adding CwsDebug to a program. For every member, property, and platform note, see the full
+reference: [`CwsDebug_Documentation.pdf`](CwsDebug_Documentation.pdf). Release history is
+tracked in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
