@@ -3,6 +3,17 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.1] - 2026-10-15
+
+### Fixed
+- A **Both** row for a digital join in the Signals panel now offers the Out (out-of-panel)
+  **Low / Pulse / High** controls as well as the In ones. Previously a paired digital row only had
+  the In controls, which change the feedback the panel shows, so driving it lit the button but
+  never ran the program's own handlers. A button wired to program logic, such as a relay, did
+  nothing from the page even though the same press on the panel worked. The two sets are now
+  labelled **In** and **Out**. Rows added as In or Out alone, and analog or serial Both rows,
+  were not affected.
+
 ## [1.6.0] - 2026-10-14
 
 ### Added
