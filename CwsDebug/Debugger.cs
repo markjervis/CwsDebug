@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.5.1
+//  Version:  1.6.0
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -213,7 +213,7 @@ namespace CwsDebug
         // the page's own version string proves exactly which build is on the processor. A
         // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
         // release time, same as every other version-bump-in-3-places step.
-        private const string Version = "1.5.1";
+        private const string Version = "1.6.0";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -296,7 +296,13 @@ namespace CwsDebug
                 _statePath   = _persistPath + ".state";
                 LoadLoggingState();
                 LoadPersisted();
-                _flushTimer = new CTimer(_ => FlushToDisk(), FlushIntervalMs, FlushIntervalMs);
+                // Each tick first publishes any CwsConsole Print fragment that has waited ~2 s for a
+                // newline (so "Connecting..." shows up), then persists. Guarded so it can't kill the tick.
+                _flushTimer = new CTimer(_ =>
+                {
+                    try { CwsConsole.FlushPending(2000); } catch { /* never let the tick die */ }
+                    FlushToDisk();
+                }, FlushIntervalMs, FlushIntervalMs);
             }
 
             var server = new HttpCwsServer(registerPath);
@@ -412,11 +418,15 @@ namespace CwsDebug
             Instance.Append("Fatal", msg, Array.Empty<object>());
         }
 
+        // Entry point for the CwsErrorLog / CwsConsole compatibility shims (CrestronCompat.cs),
+        // which pick the level by name ("Info"/"Notice"/"Warning"/"Error"). Same path as Log*.
+        internal static void Record(string level, string message, object?[] args) => Instance.Append(level, message, args);
+
         // string.Format that never throws back into the caller: a mismatched template/args pair
         // (e.g. LogInfo("{0} {1}", x)) or stray braces fall back to the raw template with the
         // args appended, so a malformed log call still records something rather than crashing
         // the program at its least-expected point — inside a logging statement.
-        private static string SafeFormat(string message, object[] args)
+        internal static string SafeFormat(string message, object?[] args)
         {
             if (args == null || args.Length == 0) return message;   // null: caller passed (object[])null
             try { return string.Format(message, args); }
@@ -444,7 +454,7 @@ namespace CwsDebug
         // timestamp, assigns the next sequence id, and appends it under the lock so concurrent CWS
         // request threads stay consistent. Enforces the ring cap and marks the buffer dirty so the
         // next flush mirrors it to disk.
-        private void Append(string level, string message, object[] args)
+        private void Append(string level, string message, object?[] args)
         {
             if (!_loggingEnabled) return;           // master switch off — record nothing
             if (RankOf(level) < MinLevel) return;   // below the configured floor — drop it entirely
@@ -2911,6 +2921,9 @@ namespace CwsDebug
                 try { _flushTimer.Stop(); _flushTimer.Dispose(); } catch { /* already torn down */ }
                 _flushTimer = null;
             }
+            // Publish any CwsConsole Print fragment still waiting for a newline, so it lands in the
+            // final snapshot instead of being lost at program stop.
+            try { CwsConsole.FlushPending(); } catch { /* best-effort on shutdown */ }
             try { FlushToDisk(); } catch { /* best-effort on shutdown */ }
 
             if (_server != null)

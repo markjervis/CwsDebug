@@ -116,6 +116,112 @@ All members are `static` on `CwsDebugPage`.
 Each `Log*` method accepts an optional `string.Format` template plus arguments, e.g.
 `CwsDebugPage.LogInfo("Connected to {0}:{1}", host, port);`
 
+Two further static classes, `CwsErrorLog` and `CwsConsole`, stand in for Crestron's `ErrorLog` and
+`CrestronConsole` — see [Migrating from ErrorLog / CrestronConsole](#migrating-from-errorlog--crestronconsole).
+
+| Member                                   | Description                                                                                   |
+|------------------------------------------|-----------------------------------------------------------------------------------------------|
+| `CwsErrorLog.Error / Info / Notice / Ok / Warn(msg, args)` | Same overloads as `ErrorLog`; records on the page at the mapped level.     |
+| `CwsErrorLog.Exception(msg, ex)`         | Records `msg` and the full exception text at Error level.                                     |
+| `CwsErrorLog.MirrorToErrorLog` *(property)* | Also forward every call to the real `ErrorLog`. Defaults to `false`.                       |
+| `CwsConsole.Print / PrintLine(msg, args)` | Same overloads as `CrestronConsole`; line-buffered onto the page.                            |
+| `CwsConsole.Flush()`                     | Publishes any pending `Print` fragment (text with no newline yet) to the page immediately.    |
+| `CwsConsole.PrintLevel` *(property)*     | Level console output is recorded at (`DebugLevel`). Defaults to Info. At Fatal, lines behave like `LogFatal`: recorded as Fatal and also written to the processor error log. |
+| `CwsConsole.PassThrough` *(property)*    | Also forward every `Print` / `PrintLine` call to the real `CrestronConsole`. Defaults to `false`. |
+| `CwsConsole.AddNewConsoleCommand` (2 overloads), `RemoveConsoleCommand`, `ConsoleCommandResponse` (2 overloads), `SendControlSystemCommand` (4 overloads: `ref string pResponse` ×2, `out StringBuilder? pResponse` ×2), `ConsoleRegistered` *(get-only property)* | The rest of `CrestronConsole`'s public surface, forwarded unchanged to the real `CrestronConsole`: same signatures, return values and exceptions. Not gated by `PassThrough`, nothing recorded on the page. `ConsoleCommandResponse` is always forwarded — it is the reply to whoever typed the console command. |
+
+## Migrating from ErrorLog / CrestronConsole
+
+Code that already logs through Crestron's `ErrorLog` and `CrestronConsole` can write to the debug
+page without touching a single call: alias the two names to CwsDebug's drop-in classes at the top
+of each file. Both classes cover their SDK class's entire public static surface, with overloads
+matching the SDK's own (same names, parameter names and types, `ref` / `out`), so every existing
+call binds unchanged and aliasing compiles even where the file also registers console commands.
+The logging calls (`ErrorLog.*`, `Print`, `PrintLine`) never throw; `CwsConsole`'s other members
+(`AddNewConsoleCommand`, `RemoveConsoleCommand`, `ConsoleCommandResponse`,
+`SendControlSystemCommand`, `ConsoleRegistered`) are pure pass-throughs to the real
+`CrestronConsole`, with the same return values and exceptions.
+
+```csharp
+using ErrorLog        = CwsDebug.CwsErrorLog;
+using CrestronConsole = CwsDebug.CwsConsole;
+```
+
+Before — the calls go to the processor error log and the console:
+
+```csharp
+using Crestron.SimplSharp;
+
+ErrorLog.Notice("Loaded {0} devices", deviceCount);
+ErrorLog.Exception("Error during init", e);
+CrestronConsole.PrintLine("Projector power: {0}", state);
+```
+
+After — the same calls, now recorded on the debug page:
+
+```csharp
+using Crestron.SimplSharp;                     // still needed for everything else
+using ErrorLog        = CwsDebug.CwsErrorLog;
+using CrestronConsole = CwsDebug.CwsConsole;
+
+ErrorLog.Notice("Loaded {0} devices", deviceCount);
+ErrorLog.Exception("Error during init", e);
+CrestronConsole.PrintLine("Projector power: {0}", state);
+```
+
+How each call lands on the page:
+
+| Crestron call                           | Page level                                                  |
+|-----------------------------------------|-------------------------------------------------------------|
+| `ErrorLog.Info`                         | Info                                                        |
+| `ErrorLog.Notice`                       | Notice                                                      |
+| `ErrorLog.Ok`                           | Notice (the page has no OK level)                           |
+| `ErrorLog.Warn`                         | Warning                                                     |
+| `ErrorLog.Error`                        | Error                                                       |
+| `ErrorLog.Exception(msg, ex)`           | Error — `msg`, a new line, then the full exception text     |
+| `CrestronConsole.Print` / `PrintLine`   | `CwsConsole.PrintLevel` (Info unless changed)               |
+
+Settings:
+
+| Setting                         | Default | Effect                                                                                         |
+|---------------------------------|---------|------------------------------------------------------------------------------------------------|
+| `CwsErrorLog.MirrorToErrorLog`  | `false` | Also forward every `ErrorLog` call, with its original arguments, to the real `ErrorLog`.        |
+| `CwsConsole.PassThrough`        | `false` | Also forward every `Print` / `PrintLine` call, with its original arguments, to the real console. |
+| `CwsConsole.PrintLevel`         | Info    | The level all console output is recorded at on the page. At Fatal, each line behaves like `CwsDebugPage.LogFatal`: recorded as Fatal on the page and also written to the processor error log. |
+
+Forwarding happens regardless of `LoggingEnabled` and `MinLevel`; recording on the page honours
+both, exactly as the `Log*` methods do.
+
+> **What is different**
+>
+> - **By default these calls write ONLY to the debug page** — nothing reaches the processor error
+>   log or the console. Turn on `MirrorToErrorLog` / `PassThrough` to keep the old destinations too.
+> - **Mirroring shows each message twice on an appliance**: once in the app log on the page, and
+>   again in the processor error log view.
+> - **`Print` is line-buffered.** The page is a list of entries, not a character stream, so `Print`
+>   text is held until a newline arrives; each complete line becomes one entry, and `PrintLine`
+>   flushes whatever is pending. Lines reach the page in the order they were buffered, even across
+>   threads. A fragment with no newline is flushed once it passes 4096 characters. A fragment left
+>   without a newline is published as its own entry once it has been pending at least 2 s, on the
+>   library's periodic 5-second tick — so typically 2–7 s later, and only once
+>   `CwsDebugPage.Register()` has run — so `Print("Connecting...")` still shows up, timestamped when
+>   it is published rather than when `Print` was called. Call `CwsConsole.Flush()` to publish a
+>   pending fragment immediately; any pending fragment is also flushed at program stop. As a result,
+>   text printed in pieces with long pauses between them can appear split across entries.
+> - **Blank lines are skipped.**
+> - **`Ok` is recorded as Notice.**
+> - **There is no Fatal equivalent** — `ErrorLog` has none to alias. Keep using
+>   `CwsDebugPage.LogFatal` for fatal messages.
+> - `Error(msginfo, errorstring)` follows the SDK: `msginfo` is the method name or other context,
+>   `errorstring` the error text, and the page shows `msginfo: errorstring`. As a convenience, if
+>   `msginfo` uses argument 0 as a format placeholder — in any form .NET accepts, such as `{0}`,
+>   `{0:X}` or `{0,8}`, but not the escaped `{{0}}` — it is formatted with `errorstring` instead.
+>   That covers `Error("Failed {0}", x)` with a string `x`, which C# binds to this overload rather
+>   than the template-plus-args one.
+> - **Console commands, `ConsoleCommandResponse` and `SendControlSystemCommand` are unchanged.**
+>   They forward straight to the real `CrestronConsole` whatever `PassThrough` is set to, and
+>   nothing they do is recorded on the page.
+
 ## Signals panel
 
 Register a device once, and its signals become browsable and drivable from the page:

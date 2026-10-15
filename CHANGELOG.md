@@ -3,6 +3,60 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6.0] - 2026-10-14
+
+### Added
+- **Drop-in replacements for `ErrorLog` and `CrestronConsole`** (suggested in #7). Existing code
+  that logs through Crestron's static classes can write to the debug page by changing one
+  using-alias per class, with no edits at the call sites:
+  `using ErrorLog = CwsDebug.CwsErrorLog;` and `using CrestronConsole = CwsDebug.CwsConsole;`.
+  Both classes cover their SDK class's entire public static surface with the SDK's own
+  signatures, so existing calls bind unchanged and aliasing compiles even where the file also
+  registers console commands. The logging methods (`ErrorLog.*`, `Print`, `PrintLine`) never throw.
+- **`CwsErrorLog`** mirrors `ErrorLog`: `Error` (template plus args, a single string, and the
+  `(string, string)` pair), `Exception(string, Exception)`, `Info`, `Notice`, `Ok` and `Warn`.
+  Levels map as Info to Info, Notice to Notice, Warn to Warning, Error and Exception to Error, and
+  Ok to Notice (the page has no OK level). `Exception` records the message followed by the full
+  exception text — type, message, stack trace and inner exceptions. The `params` overloads accept
+  nullable arguments (`object?[]`) exactly like `ErrorLog`'s, so nullable-enabled callers get no
+  new warnings.
+- **`CwsConsole`** mirrors `CrestronConsole.Print` / `PrintLine`. The console is a character stream
+  but the page is a list of entries, so output is line-buffered: `Print` text is held until a
+  newline arrives, each complete line becomes one entry, `PrintLine` flushes whatever is pending,
+  and blank lines are skipped. Lines reach the page in the order they were buffered, even across
+  threads. A fragment left without a newline is published as its own entry once it has been
+  pending at least 2 s, on the library's periodic 5-second tick — so typically 2–7 s later, and
+  only once `CwsDebugPage.Register()` has run — timestamped when it is published rather than when
+  `Print` was called. The new `CwsConsole.Flush()` publishes a pending fragment immediately, and
+  any pending fragment is flushed at program stop, so text printed in pieces with long pauses
+  between them can appear split across entries. `CwsConsole.PrintLevel` sets the level all console
+  output is recorded at (defaults to Info); at Fatal, lines behave like `CwsDebugPage.LogFatal` —
+  recorded as Fatal on the page and also written to the processor error log.
+- **`CwsConsole`** also carries the rest of `CrestronConsole`'s public surface as pure
+  pass-throughs to the real class — `AddNewConsoleCommand` (2 overloads), `RemoveConsoleCommand`,
+  `ConsoleCommandResponse` (2 overloads), `SendControlSystemCommand` (4 overloads: `ref string` and,
+  as in the SDK, `out StringBuilder` responses) and the get-only `ConsoleRegistered` — with the
+  same signatures, return values and exceptions. They are not gated by `PassThrough` and record
+  nothing on the page; `ConsoleCommandResponse` is always forwarded, since it is the reply to
+  whoever typed at the console.
+- **`CwsErrorLog.MirrorToErrorLog`** and **`CwsConsole.PassThrough`** (both default off) also
+  forward every logging call, with its original arguments, to the real `ErrorLog` /
+  `CrestronConsole` (`PassThrough` covers `Print` / `PrintLine`).
+  Forwarding happens even when `LoggingEnabled` or `MinLevel` keeps the message off the page.
+
+**By default these classes write ONLY to the debug page — not to the processor error log and not
+to the console.** Turn on `MirrorToErrorLog` / `PassThrough` to keep the old destinations as well;
+on an appliance a mirrored `ErrorLog` message then shows up twice on the page (once in the app log,
+once in the processor error log view). Page recording honours `LoggingEnabled` and `MinLevel` like
+the `Log*` methods.
+
+`Error(msginfo, errorstring)` follows the SDK: `msginfo` is the method name or other context,
+`errorstring` the error text, and the page shows `msginfo: errorstring`. As a convenience, if
+`msginfo` uses argument 0 as a format placeholder — in any form .NET accepts, such as `{0}`,
+`{0:X}` or `{0,8}`, but not the escaped `{{0}}` — it is formatted with `errorstring` instead. That
+covers a call such as `Error("Failed {0}", x)` with a string `x`, which C# binds to this overload
+rather than to the template-plus-args one.
+
 ## [1.5.1] - 2026-08-21
 
 ### Fixed
