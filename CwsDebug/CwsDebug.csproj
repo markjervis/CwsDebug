@@ -11,9 +11,9 @@
         <Description>Self-contained CWS debug log page for Crestron SIMPL#Pro programs.</Description>
         <Authors>Mark Jervis</Authors>
         <Company>Stage Front Presentation Systems</Company>
-        <Version>1.6.1</Version>
-        <AssemblyVersion>1.6.1.0</AssemblyVersion>
-        <FileVersion>1.6.1.0</FileVersion>
+        <Version>1.6.2</Version>
+        <AssemblyVersion>1.6.2.0</AssemblyVersion>
+        <FileVersion>1.6.2.0</FileVersion>
     </PropertyGroup>
 
     <ItemGroup>

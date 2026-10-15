@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.6.1
+//  Version:  1.6.2
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -213,7 +213,7 @@ namespace CwsDebug
         // the page's own version string proves exactly which build is on the processor. A
         // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
         // release time, same as every other version-bump-in-3-places step.
-        private const string Version = "1.6.1";
+        private const string Version = "1.6.2";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -2991,11 +2991,11 @@ body.light{
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:'Courier New',monospace;font-size:13px;height:100vh;display:flex;flex-direction:column;transition:background .15s,color .15s}
-header{background:var(--bg2);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid var(--border);flex-shrink:0}
+header{background:var(--bg2);padding:10px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;border-bottom:2px solid var(--border);flex-shrink:0}
 h1{font-size:16px;color:#f87171;letter-spacing:3px;text-transform:uppercase}
 .brand{display:flex;align-items:baseline;gap:8px}
 .ver{font-size:11px;color:var(--muted);letter-spacing:1px}
-.controls{display:flex;align-items:center;gap:10px}
+.controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
 #status{font-size:11px;color:var(--muted);white-space:nowrap}
 .searchbar{background:var(--bg2);padding:6px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
 #search{width:100%;background:var(--search-bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:5px 10px;font:13px 'Courier New',monospace;outline:none}
@@ -3023,7 +3023,7 @@ body.light button:hover{background:#d1d5db}
 .log::-webkit-scrollbar{width:5px}
 .log::-webkit-scrollbar-track{background:var(--bg)}
 .log::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.entry{display:flex;gap:8px;align-items:baseline;padding:4px 14px;border-bottom:1px solid var(--row-border);line-height:1.5;word-break:break-word}
+.entry{display:flex;flex-wrap:wrap;gap:0 8px;align-items:baseline;padding:4px 14px;border-bottom:1px solid var(--row-border);line-height:1.5;word-break:break-word}
 .badge{flex-shrink:0;font-size:10px;font-weight:bold;letter-spacing:1px;padding:1px 5px;border-radius:2px;text-transform:uppercase;min-width:50px;text-align:center}
 .badge-info   {background:var(--bi-bg);color:var(--bi-fg)}
 .badge-notice {background:var(--bn-bg);color:var(--bn-fg)}
@@ -3033,13 +3033,23 @@ body.light button:hover{background:#d1d5db}
 .src{flex-shrink:0;font-size:9px;font-weight:bold;letter-spacing:1px;padding:1px 4px;border-radius:2px;min-width:36px;text-align:center;border:1px solid var(--border)}
 .src-app {color:var(--muted)}
 .src-proc{color:var(--sp-fg)}
-.msg{flex:1}
-.ts{flex-shrink:0;color:var(--muted);font-size:11px}
+/* The message never shrinks below ~16em: when the row is too narrow for badge + message +
+   timestamp, the timestamp wraps to its own line (right-aligned) instead of squeezing the
+   message into a one-character column. */
+.msg{flex:1 1 16em;min-width:0}
+.ts{flex-shrink:0;margin-left:auto;color:var(--muted);font-size:11px}
 .empty{color:var(--muted);padding:12px 14px;font-style:italic}
 .main{flex:1;display:flex;overflow:hidden;min-height:0}
 .watch{background:var(--bg2);border-right:1px solid var(--border);flex-shrink:0;width:460px;min-width:280px;display:flex;flex-direction:column;overflow:hidden}
 .wsplit{width:5px;cursor:col-resize;background:var(--border);flex-shrink:0}
 .wsplit:hover{background:var(--muted)}
+/* Phones / narrow windows: stack the Signals panel above the log instead of beside it. The
+   !important beats the inline width the drag splitter stores, which only applies side by side. */
+@media (max-width:760px){
+  .main{flex-direction:column}
+  .watch{width:auto!important;min-width:0;max-height:55vh;border-right:0;border-bottom:1px solid var(--border)}
+  .wsplit{display:none}
+}
 .addwatch{display:flex;gap:6px;padding:6px 14px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--row-border)}
 .addwatch select,.addwatch input{background:var(--search-bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:4px 6px;font:12px 'Courier New',monospace;outline:none}
 .addwatch input{width:70px}
@@ -3333,7 +3343,10 @@ function renderWatch(){
     var row=document.createElement('div');
     row.className='wrow';
     var label=e.label||(e.dev+' '+e.key);
-    var h='<span class=""wkey"" title=""'+escq(e.dev+' '+e.key+(e.pair?' + '+pairInKey(e):'')+' — double-click to rename')+'""'+
+    // The label is clipped to the column width, so the tooltip leads with the full name, then the
+    // signal keys, then the rename hint — one per line (&#10; is a newline inside a title).
+    var tip=escq(label)+'&#10;'+escq(e.dev+' '+e.key+(e.pair?' + '+pairInKey(e):''))+'&#10;Double-click to rename';
+    var h='<span class=""wkey"" title=""'+tip+'""'+
           ' ondblclick=""renameWatch(\''+escAttr(e.rid)+'\')"">'+esc(label)+'</span>';
     if(e.pair){
       var jo=joinVals[e.dev+'|'+pairInKey(e)];
