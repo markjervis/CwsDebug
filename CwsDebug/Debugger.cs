@@ -1,9 +1,9 @@
-﻿// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 //  CwsDebug — Self-contained CWS debug log page for Crestron SIMPL#Pro programs.
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.6.0
+//  Version:  1.6.1
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -213,7 +213,7 @@ namespace CwsDebug
         // the page's own version string proves exactly which build is on the processor. A
         // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
         // release time, same as every other version-bump-in-3-places step.
-        private const string Version = "1.6.0";
+        private const string Version = "1.6.1";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -3083,6 +3083,7 @@ body.light button:hover{background:#d1d5db}
 .wnum.dirty{border-color:var(--bw-fg)}
 .wnum.pending{border-color:var(--bn-fg);opacity:.6}
 .wferr{flex-shrink:0;color:var(--bf-fg);font-size:11px}
+.wdir{flex-shrink:0;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin:0 2px 0 8px}
 .wlamp{flex-shrink:0;display:inline-block;width:10px;height:10px;border-radius:50%;border:1px solid var(--border);background:transparent;margin-left:6px;vertical-align:middle;transition:background .15s,box-shadow .15s}
 .wlamp.on{background:var(--bn-fg);border-color:var(--bn-fg);box-shadow:0 0 6px var(--bn-fg)}
 .wtxt{flex:1 1 90px;min-width:60px;background:var(--search-bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:2px 6px;font:12px 'Courier New',monospace;outline:none}
@@ -3337,14 +3338,15 @@ function renderWatch(){
     if(e.pair){
       var jo=joinVals[e.dev+'|'+pairInKey(e)];
       if(j&&!j.err&&j.t==='d'){
-        // Paired digital: ONE state indicator — the Out (feedback) side, which is what the
-        // force buttons drive and what lights on the panel — plus the activity lamp, which
-        // blinks on In-side (press) activity.
-        // Badge and lamp describe the SAME signal (the panel press) so they never disagree;
-        // the badge is the sampled value, so a pulse flashes the lamp without flipping it.
-        // Feedback state shows as the highlighted High/Low button instead.
-        h+=forceBtnsHtml(e.dev,e.key,j);
-        if(jo&&!jo.err)h+=badgeHtml(jo,'Panel press state')+lampHtml(e.dev+'|'+pairInKey(e),jo);
+        // Paired digital: both directions' controls, each under its own label. In (into the
+        // panel, e.key) changes the feedback the panel shows; Out (out of the panel,
+        // pairInKey) simulates a press, so the program's own SigChange handlers run. Feedback
+        // state shows as the highlighted In High/Low button; the badge and activity lamp
+        // describe the Out side (the panel press), so a pulse flashes the lamp without
+        // flipping the sampled badge.
+        h+='<span class=""wdir"" title=""Into the panel: changes what it shows"">In</span>'+forceBtnsHtml(e.dev,e.key,j);
+        if(jo&&!jo.err)h+='<span class=""wdir"" title=""Out of the panel: runs the program as a press would"">Out</span>'+
+          pressBtnsHtml(e.dev,pairInKey(e),jo)+badgeHtml(jo,'Panel press state')+lampHtml(e.dev+'|'+pairInKey(e),jo);
         else if(jo&&jo.err)h+='<span class=""werr"">'+esc(jo.err)+'</span>';
         else h+='<span class=""wval"" style=""color:var(--muted)"">&mdash;</span>';
         if(j.ferr)h+='<span class=""wferr"">'+esc(j.ferr)+'</span>';
