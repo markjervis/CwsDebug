@@ -3,6 +3,27 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7.0] - 2026-10-20
+
+### Added
+- **Non-printable characters shown as hex** (suggested in #13). Control characters
+  0x00–0x1F (except TAB and LF), DEL (0x7F) and bytes 0x80–0xFF now appear in the log as a muted,
+  tinted escape such as `\x0D` or `\xF3`, so device responses and protocol strings can be read
+  byte for byte. A CR+LF pair is still a line break; a lone CR shows as `\x0D`. Characters above
+  0xFF are real Unicode and show as-is. The 0x80–0xFF range is escaped on purpose: in SIMPL# a
+  device response is one byte per character, so 0xF3 is a byte rather than "ó" — which means
+  accented Latin-1 text such as "café" shows as `caf\xE9`.
+- **Bytes button** at the right of the level-filter bar cycles the display between `\x##` (the
+  default), `[##]` and raw (the previous behaviour). The choice is saved per browser.
+- **Search and export follow the display.** Search also matches the escaped form, so typing
+  `\x0d` finds real carriage returns, and the exported text file contains the escaped form
+  rather than raw control bytes. Read-only Serial values in the Signals panel use the same display.
+
+### Changed
+- **Whitespace is preserved in log messages** (suggested in #12). Runs of spaces,
+  tabs and line breaks are no longer collapsed, so aligned output stays aligned and multi-line
+  messages — such as the stack trace written by `LogException` — show on several lines.
+
 ## [1.6.2] - 2026-10-15
 
 ### Fixed
