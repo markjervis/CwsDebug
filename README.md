@@ -21,6 +21,9 @@ files to deploy. It builds as a **Program Library** and is referenced by your SI
   recording cheap in production; both controllable at runtime.
 - **Pause** control on the page (recording continues on the processor while paused).
 - **Millisecond timestamps** and incremental polling (only new entries are fetched).
+- **Readable raw data** — messages keep their spaces, tabs and line breaks, and non-printable
+  characters and bytes show as hex (`\x0D` or `[0D]`, or raw), so device responses can be read
+  byte for byte.
 - **Processor error log** view on hardware appliances (read via the console `err` command).
 - **Signals panel** — register a touchpanel with one line and view or change its signals live
   from the page, Toolbox-style: digital (low / pulse / high), analog and serial, plus smart-object
@@ -81,6 +84,35 @@ public class ControlSystem : CrestronControlSystem
 
 Cleanup is automatic — the library releases the CWS server and flushes the log to disk when the
 program stops or restarts — so calling `Dispose()` / `Shutdown()` by hand is optional.
+
+### Whitespace and non-printable characters
+
+Log messages keep their whitespace: runs of spaces, tabs and line breaks show exactly as logged,
+so a multi-line message such as a `LogException` stack trace appears on several lines.
+
+Characters that would otherwise be invisible show as hex in a muted, tinted style, so they can't
+be confused with the same text typed literally:
+
+- control characters 0x00–0x1F, except TAB and LF (kept as whitespace);
+- DEL (0x7F);
+- bytes 0x80–0xFF.
+
+A CR+LF pair is still a line break; a lone CR shows as `\x0D`. Characters above 0xFF are real
+Unicode and show as-is.
+
+The **Bytes** button at the right of the level-filter bar cycles the format between `\x0D` (the
+default), `[0D]` and raw (characters shown as received, the behaviour before 1.7.0). The choice is
+saved per browser. Search also matches the displayed form, so typing `\x0d` finds real carriage
+returns, and **Export** writes the displayed form, so the text file holds no raw control bytes.
+Read-only Serial values in the Signals panel use the same display.
+
+The 0x80–0xFF range is escaped on purpose: in SIMPL# a device response is one byte per character,
+so 0xF3 is a byte, not "ó". The trade-off is that accented Latin-1 text such as "café" shows as
+`caf\xE9`; switch to raw when the log is mostly text of that kind.
+
+> **Tip:** in a C# string, `\x` takes one to four hex digits, so `"\xF3Alfred"` is `\xF3A`
+> followed by `lfred`. Use `\u00F3` (always four digits) or split the string:
+> `"\xF3" + "Alfred"`.
 
 ### Browsing to the page
 

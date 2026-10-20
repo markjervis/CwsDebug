@@ -3,7 +3,7 @@
 //
 //  Author:   Mark Jervis
 //  Company:  Stage Front Presentation Systems
-//  Version:  1.6.2
+//  Version:  1.7.0
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
 //  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
@@ -213,7 +213,7 @@ namespace CwsDebug
         // the page's own version string proves exactly which build is on the processor. A
         // release drops back to plain x.x.x — bump this to match the csproj's <Version> at
         // release time, same as every other version-bump-in-3-places step.
-        private const string Version = "1.6.2";
+        private const string Version = "1.7.0";
 
         /// <summary>
         /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
@@ -3036,7 +3036,11 @@ body.light button:hover{background:#d1d5db}
 /* The message never shrinks below ~16em: when the row is too narrow for badge + message +
    timestamp, the timestamp wraps to its own line (right-aligned) instead of squeezing the
    message into a one-character column. */
-.msg{flex:1 1 16em;min-width:0}
+.msg{flex:1 1 16em;min-width:0;white-space:pre-wrap}
+/* An escaped non-printable char / byte (\x0D, [0D]): tinted so it can't be confused with
+   the same characters typed literally in a message. */
+.ctl{color:var(--muted);background:rgba(128,128,128,.18);border-radius:2px;padding:0 1px}
+.bytesbtn{margin-left:auto;padding:2px 8px;font-size:10px;text-transform:none}
 .ts{flex-shrink:0;margin-left:auto;color:var(--muted);font-size:11px}
 .empty{color:var(--muted);padding:12px 14px;font-style:italic}
 .main{flex:1;display:flex;overflow:hidden;min-height:0}
@@ -3127,6 +3131,7 @@ body.light button:hover{background:#d1d5db}
   <button class=""lvl lvl-warning on"" data-level=""Warning"" onclick=""toggleLevel('Warning')"" title=""Show/hide Warning entries (display filter only)."">Warning</button>
   <button class=""lvl lvl-error on""   data-level=""Error""   onclick=""toggleLevel('Error')"" title=""Show/hide Error entries (display filter only)."">Error</button>
   <button class=""lvl lvl-fatal on""   data-level=""Fatal""   onclick=""toggleLevel('Fatal')"" title=""Show/hide Fatal entries (display filter only)."">Fatal</button>
+  <button id=""bytesBtn"" class=""bytesbtn"" onclick=""cycleBytes()"" title=""How non-printable characters and bytes 0x80–0xFF are shown. Click to cycle."">Bytes: \x##</button>
 </div>
 <div class=""main"">
 <div class=""watch"" id=""watchPanel"" style=""display:none"">
@@ -3207,6 +3212,43 @@ var levelOn={Info:true,Notice:true,Warning:true,Error:true,Fatal:true};
 var LEVELS=['Info','Notice','Warning','Error','Fatal'];
 var BADGE={Info:'badge-info',Notice:'badge-notice',Warning:'badge-warning',Error:'badge-error',Fatal:'badge-fatal'};
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+// How non-printable chars and bytes 0x80-0xFF are displayed: 'x' -> \x0D, 'b' -> [0D], 'raw' -> as-is.
+var bytesMode='x';
+function ctlCode(c){
+  var h=c.toString(16).toUpperCase(); if(h.length<2)h='0'+h;
+  return bytesMode==='b'?'['+h+']':'\\x'+h;
+}
+// Single formatter shared by display (html=true: HTML-escaped, escapes wrapped in .ctl spans)
+// and search/export (html=false: plain text) so the two can't drift.
+// Escaped: 0x00-0x1F except TAB/LF, 0x7F, 0x80-0xFF (SIMPL# strings are one byte per char).
+// A CR+LF pair stays a real line break; a lone CR is escaped. Code points > 0xFF are real Unicode.
+function ctlRender(s,html){
+  s=String(s);
+  if(bytesMode==='raw')return html?esc(s):s;
+  var out='',run='';
+  for(var i=0;i<s.length;i++){
+    var c=s.charCodeAt(i);
+    if(c===13&&s.charCodeAt(i+1)===10){if(!html)run+='\r';continue;}
+    if((c<32&&c!==9&&c!==10)||(c>=0x7F&&c<=0xFF)){
+      var t=ctlCode(c);
+      if(html){out+=esc(run)+'<span class=""ctl"">'+t+'</span>';run='';}
+      else run+=t;
+    }else run+=s.charAt(i);
+  }
+  return out+(html?esc(run):run);
+}
+function fmtText(s){return ctlRender(s,true);}
+function plainText(s){return ctlRender(s,false);}
+function updateBytesBtn(){
+  var b=document.getElementById('bytesBtn');
+  if(b)b.textContent='Bytes: '+(bytesMode==='b'?'[##]':(bytesMode==='raw'?'raw':'\\x##'));
+}
+function cycleBytes(){
+  bytesMode=bytesMode==='x'?'b':(bytesMode==='b'?'raw':'x');
+  try{localStorage.setItem('dbg-bytes',bytesMode);}catch(x){}
+  updateBytesBtn();
+  applyFilter();
+}
 function combined(){
   var arr=[];
   if(showApp)  arr=arr.concat(debuggerEntries);
@@ -3228,7 +3270,7 @@ function render(entries){
     var proc=e.source==='Processor';
     row.innerHTML=(showSrc?'<span class=""src '+(proc?'src-proc':'src-app')+'"">'+(proc?'SYS':'APP')+'</span>':'')+
                   '<span class=""badge '+cls+'"">'+esc(e.level)+'</span>'+
-                  '<span class=""msg"">'+esc(e.msg)+'</span>'+
+                  '<span class=""msg"">'+fmtText(e.msg)+'</span>'+
                   (e.ts?'<span class=""ts"">'+esc(e.ts)+'</span>':'');
     log.appendChild(row);
   });
@@ -3325,7 +3367,7 @@ function watchCell(e,j,key){
     // In analog/serial: show the value, and when presses are available offer an editor that
     // sends it as panel input (the analog/serial equivalent of a press).
     if(devCanPress[e.dev]&&armed&&writesAllowed) h+=editorHtml(e,j,key,true);
-    else h+='<span class=""wval"" title=""'+escq(j.v)+'"">'+esc(String(j.v))+'</span>';
+    else h+='<span class=""wval"" title=""'+escq(j.v)+'"">'+fmtText(String(j.v))+'</span>';
   }else{
     h+=editorHtml(e,j,key,false);
   }
@@ -3984,7 +4026,8 @@ function visibleEntries(){
   var q=document.getElementById('search').value.toLowerCase().trim();
   var src=combined().filter(function(e){return levelOn[e.level]!==false;});
   return q?src.filter(function(e){
-    return e.msg.toLowerCase().indexOf(q)>=0||e.level.toLowerCase().indexOf(q)>=0;
+    return e.msg.toLowerCase().indexOf(q)>=0||e.level.toLowerCase().indexOf(q)>=0||
+           (bytesMode!=='raw'&&plainText(e.msg).toLowerCase().indexOf(q)>=0);
   }):src;
 }
 function pad(n){return n<10?'0'+n:''+n;}
@@ -3992,7 +4035,7 @@ function exportLog(){
   var entries=visibleEntries();
   var lines=entries.map(function(e){
     var src=e.source==='Processor'?'SYS':'APP';
-    return (e.ts||'')+'  ['+src+'] '+(e.level||'').toUpperCase()+'\t'+e.msg;
+    return (e.ts||'')+'  ['+src+'] '+(e.level||'').toUpperCase()+'\t'+plainText(e.msg);
   });
   var head=document.title+'\r\nExported '+new Date().toLocaleString()+
            '\r\nEntries: '+entries.length+
@@ -4100,7 +4143,9 @@ function toggleLogging(){
     var t12=localStorage.getItem('dbg-time-12h'); if(t12!==null) time12h=t12==='1';
     var lv=localStorage.getItem('dbg-levels');
     if(lv){var s=JSON.parse(lv);for(var k in s){if(levelOn.hasOwnProperty(k))levelOn[k]=s[k];}}
+    var bm=localStorage.getItem('dbg-bytes'); if(bm==='x'||bm==='b'||bm==='raw') bytesMode=bm;
   }catch(x){}
+  updateBytesBtn();
   if(!ERRORLOG_AVAILABLE){
     showProc=false;
     var pb=document.getElementById('procBtn');
