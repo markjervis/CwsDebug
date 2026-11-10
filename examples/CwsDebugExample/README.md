@@ -18,6 +18,7 @@ Sources and power are independent: choosing a source does not change power, and 
 
 ```
 CwsDebugExample/
+  CwsDebugExample.cpz        the compiled program, ready to load
   Construct/                 Construct project (open CwsDebugExample.csln)
     output/                  build output, included prebuilt:
       CwsDebugExample.ch5z     the panel project to load
@@ -52,8 +53,19 @@ contract code is compiled from `Construct/output`, and `CwsDebugExample.cse2j` s
 
 ## Load
 
-1. Load `CwsDebugExample.cpz` onto the processor with Toolbox or `progload`.
+Both files are included prebuilt, so the example can be loaded without building anything.
+
+1. Load `CwsDebugExample.cpz` (in this folder) onto the processor:
+   - **4-series appliance:** copy it to the processor's `/program01` folder (for example with
+     SFTP), then run `progload -p:1` at the processor's console (SSH). Remove any other
+     `.cpz` from `/program01` first: a slot holds one program.
+   - **VC-4:** add it as a program in the VC-4 web interface, then assign it to a room.
 2. Load `Construct/output/CwsDebugExample.ch5z` to an XPanel or touch panel at IP ID 03.
+
+To load your own build instead, use `Program/bin/Release/net8.0/CwsDebugExample.cpz` from the
+build step above. The prebuilt `.cpz` was made with
+`dotnet build Program/CwsDebugExample.csproj -c Release -p:ContinuousIntegrationBuild=true`,
+which keeps the build machine's folder paths out of the debug symbols.
 
 ## Open the debug page
 
