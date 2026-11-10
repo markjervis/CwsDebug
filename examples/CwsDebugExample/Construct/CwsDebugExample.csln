@@ -1,0 +1,20 @@
+{
+  "_fileMetadata": {
+    "_schema": "1.0.0.0",
+    "_createdByAppHost": "2.1901.29.0",
+    "_created": "2026-11-09T22:03:40.9743752-06:00",
+    "_lastModifiedByAppHost": "2.1901.29.0",
+    "_minimumAppHost": "2.1900.0",
+    "_modified": "2026-11-09T22:03:42.0565793-06:00"
+  },
+  "_solution": {
+    "_name": "CwsDebugExample",
+    "_projects": [
+      {
+        "_name": "CwsDebugExample",
+        "_filename": "CwsDebugExample.cuip",
+        "_datetime": "2026-11-10T04:03:42.0527251Z"
+      }
+    ]
+  }
+}

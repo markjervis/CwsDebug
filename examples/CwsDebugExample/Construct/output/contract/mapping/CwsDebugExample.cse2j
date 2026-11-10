@@ -1,0 +1,91 @@
+{
+  "name": "CwsDebugExample",
+  "timestamp": "2026-11-08T14:06:26.5931744+00:00",
+  "version": "1.0.0.0",
+  "schema_version": 1,
+  "extra_value": "",
+  "signals": {
+    "states": {
+      "boolean": {
+        "1": {
+          "3": "Main.Toggle.Selected"
+        },
+        "3": {
+          "1201": "Main.WidgetList.Items[0].ButtonListCONTRACT.Button.Selected"
+        },
+        "4": {
+          "1201": "Main.WidgetList.Items[1].ButtonListCONTRACT.Button.Selected"
+        },
+        "5": {
+          "1201": "Main.WidgetList.Items[2].ButtonListCONTRACT.Button.Selected"
+        },
+        "6": {
+          "1201": "Main.WidgetList.Items[3].ButtonListCONTRACT.Button.Selected"
+        },
+        "7": {
+          "1201": "Main.WidgetList.Items[4].ButtonListCONTRACT.Button.Selected"
+        }
+      },
+      "numeric": {
+        "1": {
+          "4": "Main.Slider.LowerTouchfb"
+        },
+        "2": {
+          "1": "Main.WidgetList.Set_Number_Of_Items"
+        }
+      },
+      "string": {
+        "3": {
+          "1": "Main.WidgetList.Items[0].ButtonListCONTRACT.Button.IndirectText"
+        },
+        "4": {
+          "1": "Main.WidgetList.Items[1].ButtonListCONTRACT.Button.IndirectText"
+        },
+        "5": {
+          "1": "Main.WidgetList.Items[2].ButtonListCONTRACT.Button.IndirectText"
+        },
+        "6": {
+          "1": "Main.WidgetList.Items[3].ButtonListCONTRACT.Button.IndirectText"
+        },
+        "7": {
+          "1": "Main.WidgetList.Items[4].ButtonListCONTRACT.Button.IndirectText"
+        }
+      }
+    },
+    "events": {
+      "boolean": {
+        "Main.Toggle.Press": {
+          "joinId": 3,
+          "smartObjectId": 1
+        },
+        "Main.WidgetList.Items[0].ButtonListCONTRACT.Button.Press": {
+          "joinId": 1201,
+          "smartObjectId": 3
+        },
+        "Main.WidgetList.Items[1].ButtonListCONTRACT.Button.Press": {
+          "joinId": 1201,
+          "smartObjectId": 4
+        },
+        "Main.WidgetList.Items[2].ButtonListCONTRACT.Button.Press": {
+          "joinId": 1201,
+          "smartObjectId": 5
+        },
+        "Main.WidgetList.Items[3].ButtonListCONTRACT.Button.Press": {
+          "joinId": 1201,
+          "smartObjectId": 6
+        },
+        "Main.WidgetList.Items[4].ButtonListCONTRACT.Button.Press": {
+          "joinId": 1201,
+          "smartObjectId": 7
+        }
+      },
+      "numeric": {
+        "Main.Slider.LowerTouch": {
+          "joinId": 4,
+          "smartObjectId": 1
+        }
+      },
+      "string": {}
+    }
+  }
+}
