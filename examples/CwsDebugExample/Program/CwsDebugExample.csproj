@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- The assembly name sets the program file the build produces: CwsDebugExample.cpz. The
+         code keeps the namespace Example because the generated Construct contract code already
+         uses the namespace CwsDebugExample, and the two would collide. -->
+    <PropertyGroup>
+        <OutputType>Library</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>Example</RootNamespace>
+        <AssemblyName>CwsDebugExample</AssemblyName>
+    </PropertyGroup>
+
+    <!-- CwsDebug is built from the library project in this repository, so the example always
+         runs against the current source. In your own program, reference CwsDebug.csproj or a
+         compiled CwsDebug.dll instead. -->
+    <ItemGroup>
+      <ProjectReference Include="..\..\..\CwsDebug\CwsDebug.csproj" />
+      <PackageReference Include="Crestron.SimplSharp.SDK.Program" Version="2.21.257" />
+    </ItemGroup>
+
+    <!-- Construct contract support, compiled straight from the Construct project's output so a
+         regenerated contract is picked up on the next build without copying files around. -->
+    <ItemGroup>
+      <Compile Include="..\Construct\output\contract\programming\SIMPLSharp\ContractSupport\**\*.cs">
+        <LinkBase>ContractSupport</LinkBase>
+      </Compile>
+    </ItemGroup>
+
+    <!-- The contract's runtime manifest: RegisterContract reads it on the processor to name
+         signals by contract path. Linked from the Construct output and shipped at the output
+         root under its own name, so ControlSystem.cs can use a plain relative path. -->
+    <ItemGroup>
+      <None Include="..\Construct\output\contract\mapping\CwsDebugExample.cse2j">
+        <Link>CwsDebugExample.cse2j</Link>
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </None>
+    </ItemGroup>
+
+    <!-- The build produces CwsDebugExample.cpz in the output folder; load it onto the
+         processor with Toolbox or progload. -->
+
+</Project>

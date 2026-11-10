@@ -1,0 +1,182 @@
+{FileMetadata}
+Schema = "1.0.0.0"
+CreatedByAppHost = "2.1901.29.0"
+Created = 2026-11-08 09:06:26.446844-05:00
+LastModifiedByAppHost = "2.1901.29.0"
+Modified = 2026-11-08 09:06:26.44683-05:00
+CreatedByProjectApp = "1.5001.43.0"
+LastModifiedByProjectApp = "1.5001.43.0"
+MinimumProjectApp = "1.2600.1"
+MinimumAppHost = "2.1900.0"
+
+{Html}
+<ch5-toggle handleshape="circle" orientation="horizontal" size="large" value="false" customvstheme="custom" id="ic3hl" componentName="Toggle" ccid_linkSendReceive="True" ccid_ActiveFont="'Roboto'" ccid_Label="" ccid_ComponentType="Toggle" devicesVisited="[&quot;TSW-880&quot;]" sendeventonclick="Contract Enabled" pd-receivestatevalue="Contract Enabled">
+              </ch5-toggle><ch5-slider nohandle="false" orientation="horizontal" tapsettable="false" handleshape="rounded-rectangle" handlesize="regular" tooltipshowtype="off" tooltipdisplaytype="%" value="50" slidertype="fader" customvstheme="theme" min="0" max="100" step="1" id="i9q1z" componentName="Slider" ccid_linkSendReceive="True" ccid_ComponentType="Slider" devicesVisited="[&quot;TSW-880&quot;]" size="custom" ccid_customSizeSet sendeventonchange="Contract Enabled" pd-receivestatevalue="Contract Enabled">
+              </ch5-slider><div data-mytext="myText" componentName="Html-text" id="i76j" ccid_ComponentType="Html-text" ccid_ActiveFont="'Roboto'" devicesVisited="[&quot;TSW-880&quot;]">Sources</div><div data-mytext="myText" componentName="Html-text" id="ivol1" ccid_ComponentType="Html-text" ccid_ActiveFont="'Roboto'" devicesVisited="[&quot;TSW-880&quot;]">Volume</div><div data-mytext="myText" componentName="Html-text" id="ipwr1" ccid_ComponentType="Html-text" ccid_ActiveFont="'Roboto'" devicesVisited="[&quot;TSW-880&quot;]">Power</div><h1 headingType="h1" data-mytext="myText" componentName="Html-header" id="ibz5" ccid_ComponentType="Html-header" ccid_ActiveFont="'Roboto'" devicesVisited="[&quot;TSW-880&quot;]">CwsDebug Example</h1><ch5-subpage-reference-list orientation="horizontal" columns="1" rows="1" centeritems="true" numberofitems="5" scrolltoposition="0" scrollbar="false" endless="false" indexid="idx" useContractForCustomStyle="false" useContractForCustomClass="false" useContractForEnable="false" useContractForShow="false" useContractForNumItems="true" useContractForItemEnable="false" useContractForItemShow="false" customvstheme="theme" loaditems="all" id="i74g" componentName="Widget List" ccid_linkSendReceive="True" ccid_ComponentType="Widget List" devicesVisited="[&quot;TSW-880&quot;]" widgetid="wd67d41c2-06fa-4d40-ad6e-8daa8162864f" pd-receivestatenumberofitems="Contract Enabled">
+              </ch5-subpage-reference-list>
+
+{Css}
+@media (max-width: 99999px){#iqrp{background-color:#F3F4F6;}#i74g{width:1180px;height:auto;display:block;left:48px;top:168px;position:absolute;z-index:2;}#ibz5{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:34px;custom-font-size:34px;font-weight:700;color:#111827;min-height:1.5em;left:48px;top:40px;z-index:3;pd-original_color:#111827;pd-original_background-color:transparent;pd-original_border-color:transparent;}#i76j{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:15px;custom-font-size:15px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#6B7280;min-height:24px;left:48px;top:132px;z-index:4;pd-original_color:#6B7280;pd-original_background-color:transparent;pd-original_border-color:transparent;}#ivol1{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:15px;custom-font-size:15px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#6B7280;min-height:24px;left:48px;top:340px;z-index:8;pd-original_color:#6B7280;pd-original_background-color:transparent;pd-original_border-color:transparent;}#ipwr1{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:15px;custom-font-size:15px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#6B7280;min-height:24px;left:48px;top:500px;z-index:9;pd-original_color:#6B7280;pd-original_background-color:transparent;pd-original_border-color:transparent;}#i9q1z{width:1184px;height:60px;display:block;left:48px;top:380px;position:absolute;z-index:6;--ch5-slider--width-regular:1184px;}#ic3hl{width:100px;display:block;left:48px;top:540px;position:absolute;z-index:7;height:33px;}#i9q1z .ch5-slider :not(i):not(svg){font-family:Roboto;}#ic3hl .ch5-toggle :not(i):not(svg){font-family:'Roboto';}ch5-toggle#ic3hl{width:auto !important;height:auto !important;}}@media (orientation: landscape) and (max-width: 1281px) and (max-height: 801px), (orientation: landscape) and (max-width: 1279px){#i74g{width:1180px;height:auto;display:block;left:48px;top:168px;position:absolute;}#ibz5{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:34px;custom-font-size:34px;font-weight:700;color:#111827;min-height:1.5em;left:48px;top:40px;pd-original_color:#111827;pd-original_background-color:transparent;pd-original_border-color:transparent;}#i76j{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:15px;custom-font-size:15px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#6B7280;min-height:24px;left:48px;top:132px;pd-original_color:#6B7280;pd-original_background-color:transparent;pd-original_border-color:transparent;}#ivol1{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:15px;custom-font-size:15px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#6B7280;min-height:24px;left:48px;top:340px;pd-original_color:#6B7280;pd-original_background-color:transparent;pd-original_border-color:transparent;}#ipwr1{overflow:hidden;min-width:1em;text-underline-offset:0.3em;font-family:'Roboto';display:block;background-color:transparent;border-color:transparent;margin:0;position:absolute;font-style:normal;font-size:15px;custom-font-size:15px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:#6B7280;min-height:24px;left:48px;top:500px;pd-original_color:#6B7280;pd-original_background-color:transparent;pd-original_border-color:transparent;}#i9q1z{width:1184px;height:60px;display:block;left:48px;top:380px;position:absolute;--ch5-slider--width-regular:1184px;}#ic3hl{width:100px;display:block;left:48px;top:540px;position:absolute;height:33px;}}
+
+{PageAttributes}
+
+[Attributes]
+Name = "Main"
+PageMode = "absolute"
+Id = "44a32a2f-5c8e-4e7c-b816-aadf56b607c1"
+StartPage = "True"
+PreloadPage = "True"
+CachePage = "True"
+VisibilityJoin = "0"
+DisplayBackgroundColor = "False"
+TransitionIn = ""
+TransitionOut = ""
+TransitionDuration = "1.00s"
+TransitionDelay = "0.00s"
+
+[[Elements]]
+Type = "Ch5 Toggle"
+Editable = true
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "\n              "
+
+[Elements.Attributes]
+handleshape = "circle"
+orientation = "horizontal"
+size = "large"
+value = "false"
+customvstheme = "custom"
+id = "ic3hl"
+componentName = "Toggle"
+ccid_linkSendReceive = "True"
+ccid_ActiveFont = "'Roboto'"
+ccid_Label = ""
+ccid_ComponentType = "Toggle"
+devicesVisited = "[\"TSW-880\"]"
+sendeventonclick = "Contract Enabled"
+pd-receivestatevalue = "Contract Enabled"
+[[Elements]]
+Type = "Ch5 Slider"
+Editable = true
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "\n              "
+
+[Elements.Attributes]
+nohandle = "false"
+orientation = "horizontal"
+tapsettable = "false"
+handleshape = "rounded-rectangle"
+handlesize = "regular"
+tooltipshowtype = "off"
+tooltipdisplaytype = "%"
+value = "50"
+slidertype = "fader"
+customvstheme = "theme"
+min = "0"
+max = "100"
+step = "1"
+id = "i9q1z"
+componentName = "Slider"
+ccid_linkSendReceive = "True"
+ccid_ComponentType = "Slider"
+devicesVisited = "[\"TSW-880\"]"
+size = "custom"
+ccid_customSizeSet = "true"
+sendeventonchange = "Contract Enabled"
+pd-receivestatevalue = "Contract Enabled"
+[[Elements]]
+Type = "html-text"
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "Sources"
+
+[Elements.Attributes]
+data-mytext = "myText"
+componentName = "Html-text"
+id = "i76j"
+ccid_ComponentType = "Html-text"
+ccid_ActiveFont = "'Roboto'"
+devicesVisited = "[\"TSW-880\"]"
+[[Elements]]
+Type = "html-text"
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "Volume"
+
+[Elements.Attributes]
+data-mytext = "myText"
+componentName = "Html-text"
+id = "ivol1"
+ccid_ComponentType = "Html-text"
+ccid_ActiveFont = "'Roboto'"
+devicesVisited = "[\"TSW-880\"]"
+[[Elements]]
+Type = "html-text"
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "Power"
+
+[Elements.Attributes]
+data-mytext = "myText"
+componentName = "Html-text"
+id = "ipwr1"
+ccid_ComponentType = "Html-text"
+ccid_ActiveFont = "'Roboto'"
+devicesVisited = "[\"TSW-880\"]"
+[[Elements]]
+Type = "html-header"
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "CwsDebug Example"
+
+[Elements.Attributes]
+headingType = "h1"
+data-mytext = "myText"
+componentName = "Html-header"
+id = "ibz5"
+ccid_ComponentType = "Html-header"
+ccid_ActiveFont = "'Roboto'"
+devicesVisited = "[\"TSW-880\"]"
+[[Elements]]
+Type = "Ch5 Subpage Reference List"
+Editable = true
+
+[[Elements.Components]]
+Type = "textnode"
+Content = "\n              "
+
+[Elements.Attributes]
+orientation = "horizontal"
+columns = "1"
+rows = "1"
+centeritems = "true"
+numberofitems = "5"
+scrolltoposition = "0"
+scrollbar = "false"
+endless = "false"
+indexid = "idx"
+useContractForCustomStyle = "false"
+useContractForCustomClass = "false"
+useContractForEnable = "false"
+useContractForShow = "false"
+useContractForNumItems = "true"
+useContractForItemEnable = "false"
+useContractForItemShow = "false"
+customvstheme = "theme"
+loaditems = "all"
+id = "i74g"
+componentName = "Widget List"
+ccid_linkSendReceive = "True"
+ccid_ComponentType = "Widget List"
+devicesVisited = "[\"TSW-880\"]"
+widgetid = "wd67d41c2-06fa-4d40-ad6e-8daa8162864f"
+pd-receivestatenumberofitems = "Contract Enabled"
+

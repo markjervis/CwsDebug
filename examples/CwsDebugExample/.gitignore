@@ -1,0 +1,7 @@
+# Construct archive and editor state
+*.cca
+.cse
+
+# Build output (also ignored at the repository root)
+Program/bin/
+Program/obj/
