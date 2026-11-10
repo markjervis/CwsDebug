@@ -10,6 +10,9 @@
         <Nullable>enable</Nullable>
         <RootNamespace>Example</RootNamespace>
         <AssemblyName>CwsDebugExample</AssemblyName>
+        <!-- Keep the build machine's folder out of the compiled program: the compiler records
+             the .pdb path and source paths, which would otherwise show local user and folder names. -->
+        <PathMap>$(MSBuildProjectDirectory)=/_/CwsDebugExample</PathMap>
     </PropertyGroup>
 
     <!-- CwsDebug is built from the library project in this repository, so the example always
@@ -38,7 +41,7 @@
       </None>
     </ItemGroup>
 
-    <!-- The build produces CwsDebugExample.cpz in the output folder; load it onto the
-         processor with Toolbox or progload. -->
+    <!-- The build produces CwsDebugExample.cpz in the output folder. To load it, copy it to the
+         processor's /program01 folder and run progload -p:1 (see README.md). -->
 
 </Project>
