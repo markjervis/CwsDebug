@@ -3981,7 +3981,17 @@ var needRender=false;  // persists across polls: set when data changes, cleared 
                        // If one fetch of a poll succeeds (appending entries / advancing lastSeq)
                        // but a sibling fetch rejects, the flag survives so the NEXT successful
                        // poll paints the stranded entries instead of losing them until new data.
-function refresh(){
+// One log round in flight at a time, as with the signals poll: over a slow link a 2s timer
+// would otherwise stack requests that all ask for the same 'since' and then append the same
+// entries more than once. A timer tick that lands while a round is outstanding is skipped
+// (the next tick catches up, since lastSeq only moves when a reply lands). An explicit call
+// (toggleSource) is not dropped: it runs as soon as the outstanding round settles.
+var refreshInFlight=false, refreshQueued=false;
+function refresh(explicit){
+  if(refreshInFlight){if(explicit===true)refreshQueued=true;return;}
+  refreshInFlight=true;
+  var failed=false;
+  function settle(p){return p.catch(function(){failed=true;});}
   var tasks=[fetch('api/logs?since='+lastSeq).then(function(r){return r.json();}).then(function(d){
     if(d.entries&&d.entries.length){
       needRender=true;
@@ -4001,10 +4011,16 @@ function refresh(){
     if(JSON.stringify(next)!==JSON.stringify(processorEntries)) needRender=true;
     processorEntries=next;
   }));
-  Promise.all(tasks).then(function(){
+  // Every fetch is settled before the round ends, so a failed api/logs cannot free the slot
+  // while api/errorlog (or the reverse) is still outstanding. The flag is cleared on every path.
+  Promise.all(tasks.map(settle)).then(function(){
+    if(failed){document.getElementById('status').textContent='Connection error';return;}
     if(needRender){applyFilter();needRender=false;}
     renderStatus();
-  }).catch(function(){document.getElementById('status').textContent='Connection error';});
+  }).catch(function(){}).then(function(){
+    refreshInFlight=false;
+    if(refreshQueued){refreshQueued=false;refresh();}
+  });
 }
 var time12h=true;   // persisted; the header ""Updated"" clock only — log-entry timestamps are
                     // left as the server's own fixed format, which is unambiguous either way.
@@ -4060,7 +4076,7 @@ function toggleSource(which){
   document.getElementById('procBtn').classList.toggle('on',showProc);
   try{localStorage.setItem('dbg-show-app',showApp?'1':'0');localStorage.setItem('dbg-show-proc',showProc?'1':'0');}catch(x){}
   applyFilter();   // re-render now with the new source mix; refresh() only renders on new data
-  refresh();
+  refresh(true);
 }
 function toggleLevel(name){
   levelOn[name]=!levelOn[name];

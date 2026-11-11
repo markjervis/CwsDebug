@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `PathMap` keeps the build machine's folder paths out of `CwsDebug.dll`.
 - Documented page URLs now use `https://`; VC-4 URLs name the `<server>` and explain `<roomId>`.
 
+### Fixed
+- The page's 2-second log poll now keeps only one round in flight, as the signals poll already
+  does. On a slow link, requests no longer stack up and the same entries can no longer be
+  appended twice. A tick that lands while a round is still outstanding is skipped, and the next
+  one catches up.
+
 ## [1.7.0] - 2026-10-20
 
 ### Added
@@ -182,7 +188,7 @@ rather than to the template-plus-args one.
   resolutions, and a top-level guard so a browser closing mid-request cannot surface an error.
 - Signal-change subscriptions are attached and detached outside the library's own lock, removing a
   potential stall when a busy panel is re-registered.
-- Log lines and error replies are never written while the device lock is held.
+- Log lines and error replies are written after the device lock is released; the one exception, an idle-timeout audit line, keeps the safe lock order (device lock, then log lock).
 - The force arm timer is read atomically, so it cannot mis-expire on a 32-bit processor.
 - Reading a Smart Graphics file is bounded and streamed rather than buffered whole.
 
