@@ -118,8 +118,12 @@ so 0xF3 is a byte, not "ó". The trade-off is that accented Latin-1 text such as
 
 | Platform               | URL                                                                          |
 |------------------------|------------------------------------------------------------------------------|
-| Appliance (RMC4, etc.) | `http://<processor>/cws/debugger/debugger.html`                              |
-| VC-4 (Server)          | `http://<processor>/VirtualControl/Rooms/<roomId>/cws/debugger.html`         |
+| Appliance (RMC4, etc.) | `https://<processor>/cws/debugger/debugger.html`                             |
+| VC-4 (Server)          | `https://<server>/VirtualControl/Rooms/<roomId>/cws/debugger.html`           |
+
+Registering your own path, such as `/example`, puts it in the URL on both platforms, for example
+`…/cws/example/debugger.html`. `<roomId>` is the room's ID in VC-4, not its display name. Use
+`http://` instead if the processor has HTTPS turned off.
 
 ## API reference
 

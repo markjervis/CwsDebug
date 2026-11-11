@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Documentation and code comments now call CWS by its SDK name, Crestron Web Scripting.
 - `PathMap` keeps the build machine's folder paths out of `CwsDebug.dll`.
+- Documented page URLs now use `https://`; VC-4 URLs name the `<server>` and explain `<roomId>`.
 
 ## [1.7.0] - 2026-10-20
 
