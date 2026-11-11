@@ -3,6 +3,12 @@
 All notable changes to CwsDebug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- Documentation and code comments now call CWS by its SDK name, Crestron Web Scripting.
+- `PathMap` keeps the build machine's folder paths out of `CwsDebug.dll`.
+
 ## [1.7.0] - 2026-10-20
 
 ### Added
