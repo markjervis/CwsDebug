@@ -107,10 +107,11 @@ namespace CwsDebug
         //
         // LOCK ORDERING INVARIANT: code holding _lock must NEVER take _devLock — that inversion
         // would deadlock. _lock-holding code (Append/flush/serve-logs) never touches device
-        // state; keep it that way. The reverse direction is avoided too: the join paths build
-        // their log lines and error replies while holding _devLock but EMIT them after releasing
-        // it (see MarkSigActivity, ServeJoins, WriteJoin), so in practice the two locks are never
-        // held at once in either order.
+        // state; keep it that way. The other order, _devLock then _lock, is allowed and happens in
+        // one place: ServeJoins calls CheckArmIdle under _devLock, and an idle timeout writes an
+        // audit line (AppendAudit takes _lock). Everywhere else the join paths build their log
+        // lines and error replies while holding _devLock but EMIT them after releasing it (see
+        // MarkSigActivity, ServeJoins, WriteJoin), which keeps _devLock hold times short.
         //
         // Related, and easy to get wrong: do not call into the SDK's event accessors
         // (SigChange +=/-=) while holding _devLock. The SDK holds its own event lock while
@@ -189,11 +190,13 @@ namespace CwsDebug
         private int  _forceCount;                            // accepted forces in the window
         private const int MaxForcesPerSecond = 20;
 
-        // Caps and cadences. _maxEntries bounds memory and the JSON payload; the log is a true ring —
-        // once full, the oldest line is dropped as each new one arrives. It defaults to DefaultMaxEntries
-        // and can be raised/lowered per program when Register() is called. FlushIntervalMs is how often a
-        // changed buffer is mirrored to disk (plus a final flush on program stop), which both bounds flash
-        // wear and bounds how much is lost to a hard power-cut between flushes.
+        // Caps and cadences. _maxEntries bounds memory and the JSON payload. The log is trimmed in
+        // chunks: it may run about 10% past _maxEntries, then the oldest lines are removed in one step
+        // back down to it (see Append/AppendAudit), so each log call stays cheap. It defaults to
+        // DefaultMaxEntries and can be raised/lowered per program when Register() is called.
+        // FlushIntervalMs is how often a changed buffer is mirrored to disk (plus a final flush on
+        // program stop), which both bounds flash wear and bounds how much is lost to a hard power-cut
+        // between flushes.
         private const int DefaultMaxEntries = 2000;
         private const int FlushIntervalMs   = 5000;
 
@@ -225,9 +228,9 @@ namespace CwsDebug
         /// .../cws/debugger.html. Pass an explicit (non-default) base path to keep it in the
         /// URL on every platform — required if a single program hosts more than one page.
         ///
-        /// maxEntries caps the in-memory (and persisted) ring buffer; older lines are dropped once
-        /// it is full. It defaults to DefaultMaxEntries (2000). A value &lt;= 0 is ignored and the
-        /// default is kept.
+        /// maxEntries caps the in-memory (and persisted) ring buffer; older lines are trimmed in one
+        /// step once it runs about 10% over. It defaults to DefaultMaxEntries (2000). A value
+        /// &lt;= 0 is ignored and the default is kept.
         /// </summary>
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static void Register(string basePath = DefaultBasePath, int maxEntries = DefaultMaxEntries)
@@ -2213,9 +2216,9 @@ namespace CwsDebug
                 CheckArmIdle();
                 sb.Append(",\"armed\":").Append(_armed ? "true" : "false");
                 sb.Append(",\"writesAllowed\":").Append(_writesAllowed ? "true" : "false");
-                // Whether this device supports simulated presses on its In rows (the mechanism
+                // Whether this device supports simulated presses on its Out rows (the mechanism
                 // resolved on this SDK build). Per-device because it depends on the device's own
-                // collection type; the page uses it to show or hide the Press/Tap/Release buttons.
+                // collection type; the page uses it to show or hide the Out buttons.
                 sb.Append(",\"canPress\":").Append(CanPress(device) ? "true" : "false");
                 try { sb.Append(",\"online\":").Append(device.IsOnline ? "true" : "false"); } catch { }
                 sb.Append(",\"joins\":[").Append(entries).Append("]}");
@@ -2452,7 +2455,7 @@ namespace CwsDebug
             else if (path.EndsWith("api/join", StringComparison.OrdinalIgnoreCase) && method == "POST")
                 WriteJoin(context);                 // force one join (arm-gated, audited)
             else if (path.EndsWith("api/press", StringComparison.OrdinalIgnoreCase) && method == "POST")
-                PressJoin(context);                 // simulate panel activity on an In signal (arm-gated, audited)
+                PressJoin(context);                 // simulate a press on an Out signal; handlers run (arm-gated, audited)
             else if (path.EndsWith("api/arm", StringComparison.OrdinalIgnoreCase))
                 ServeArm(context, method);          // GET reads / POST sets the force arm gate
             else
@@ -2960,8 +2963,9 @@ namespace CwsDebug
             s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
 
         // The complete single-page UI (markup + CSS + JavaScript) as a verbatim string, so the
-        // library has no external content files to deploy. Placeholders __TITLE__ / __ERRORLOG__
-        // are filled in by BuildHtml. The script polls api/logs every 2s and renders client-side.
+        // library has no external content files to deploy. Placeholders __TITLE__, __VERSION__,
+        // __ERRORLOG__, __LOGGING__, __MAXENTRIES__ and __WATCH__ are filled in by BuildHtml. The
+        // script polls api/logs every 2s and renders client-side.
         private static string BuildHtmlTemplate() => @"<!DOCTYPE html>
 <html lang=""en"">
 <head>
@@ -3716,8 +3720,8 @@ function analogKey(ev,dev,key,input,inject){
   if(inject)pressJoin(dev,key,'send',String(n));else forceJoin(dev,key,String(n));
   input.blur();
 }
-// Simulate panel activity on a read-only In signal so the program's handlers run. Arm-gated the
-// same as forcing; the server audits every attempt. A digital act is press|release|tap (no value);
+// Simulate a press on an Out signal (out of the panel) so the program's handlers run. Arm-gated the
+// same as forcing; the server audits every attempt. A digital act is low|pulse|high (no value);
 // analog/serial use act 'send' with a value.
 function pressJoin(dev,key,act,val){
   if(!(armed&&writesAllowed)){setStatus('Arm forcing first (Disarmed button)');return;}
