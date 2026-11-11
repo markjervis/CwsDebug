@@ -10,6 +10,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `PathMap` keeps the build machine's folder paths out of `CwsDebug.dll`.
 - Documented page URLs now use `https://`; VC-4 URLs name the `<server>` and explain `<roomId>`.
 
+### Fixed
+- The page's 2-second log poll now keeps only one round in flight, as the signals poll already
+  does. On a slow link, requests no longer stack up and the same entries can no longer be
+  appended twice. A tick that lands while a round is still outstanding is skipped, and the next
+  one catches up.
+
 ## [1.7.0] - 2026-10-20
 
 ### Added
