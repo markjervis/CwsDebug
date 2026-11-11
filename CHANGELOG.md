@@ -188,7 +188,7 @@ rather than to the template-plus-args one.
   resolutions, and a top-level guard so a browser closing mid-request cannot surface an error.
 - Signal-change subscriptions are attached and detached outside the library's own lock, removing a
   potential stall when a busy panel is re-registered.
-- Log lines and error replies are never written while the device lock is held.
+- Log lines and error replies are written after the device lock is released; the one exception, an idle-timeout audit line, keeps the safe lock order (device lock, then log lock).
 - The force arm timer is read atomically, so it cannot mis-expire on a 32-bit processor.
 - Reading a Smart Graphics file is bounded and streamed rather than buffered whole.
 
