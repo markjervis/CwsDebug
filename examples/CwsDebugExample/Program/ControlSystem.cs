@@ -23,7 +23,8 @@
 //      its output folder (included prebuilt; see CwsDebugExample.csproj).
 //    - A panel or XPanel at IP ID 03 running Construct/output/CwsDebugExample.ch5z.
 //
-//  Debug page:  http://<processor>/cws/example/debugger.html
+//  Debug page:  https://<processor>/cws/example/debugger.html
+//         VC-4: https://<server>/VirtualControl/Rooms/<roomId>/cws/example/debugger.html
 // ============================================================================================
 
 using Crestron.SimplSharp;                    // CrestronEnvironment (program start/stop events)

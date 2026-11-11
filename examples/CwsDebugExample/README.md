@@ -71,11 +71,12 @@ which keeps the build machine's folder paths out of the debug symbols.
 
 | Platform     | URL                                                                         |
 |--------------|-----------------------------------------------------------------------------|
-| Appliance    | `http://<processor>/cws/example/debugger.html`                              |
-| VC-4         | `http://<server>/VirtualControl/Rooms/<roomId>/cws/example/debugger.html`   |
+| Appliance    | `https://<processor>/cws/example/debugger.html`                             |
+| VC-4         | `https://<server>/VirtualControl/Rooms/<roomId>/cws/example/debugger.html`  |
 
 The program registers the page at `/example`, a non-default base path, so the segment stays in
-the URL on VC-4 too.
+the URL on VC-4 too. `<roomId>` is the room's ID in VC-4, not its display name. Use `http://`
+instead if the processor has HTTPS turned off.
 
 ## Things to try
 

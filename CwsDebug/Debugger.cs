@@ -44,8 +44,8 @@ namespace CwsDebug
     ///   CwsDebugPage.Register("/debugger");
     ///   // anywhere in the program, on any thread:
     ///   CwsDebugPage.LogInfo("Connected to {0}:{1}", host, port);
-    ///   // Appliance: http://&lt;processor&gt;/cws/debugger/debugger.html
-    ///   // VC-4:      http://&lt;processor&gt;/VirtualControl/Rooms/&lt;roomId&gt;/cws/debugger.html
+    ///   // Appliance: https://&lt;processor&gt;/cws/debugger/debugger.html
+    ///   // VC-4:      https://&lt;server&gt;/VirtualControl/Rooms/&lt;roomId&gt;/cws/debugger.html
     ///
     /// The CWS server is released automatically when the program stops or restarts (via
     /// CrestronEnvironment.ProgramStatusEventHandler), with a finalizer as a backstop, so
