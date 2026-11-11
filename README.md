@@ -2,7 +2,7 @@
 
 A self-contained CWS debug log page for Crestron SIMPL#Pro programs.
 
-CwsDebug hosts a small web page on the Crestron Web Server (CWS) that streams your program's
+CwsDebug hosts a small web page through Crestron Web Scripting (CWS) that streams your program's
 own log messages and — on a hardware appliance — the processor error log. The entire UI
 (markup, CSS, and JavaScript) is embedded in the library, so there are no external content
 files to deploy. It builds as a **Program Library** and is referenced by your SIMPL#Pro program.

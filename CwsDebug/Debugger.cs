@@ -6,8 +6,8 @@
 //  Version:  1.7.0
 //
 //  Builds as a Program Library (Crestron.SimplSharp.SDK.ProgramLibrary) and is
-//  referenced by a SIMPL#Pro program. It hosts a small web page on the Crestron
-//  Web Server (CWS) that streams the program's own log messages plus, on a
+//  referenced by a SIMPL#Pro program. It hosts a small web page through Crestron
+//  Web Scripting (CWS) that streams the program's own log messages plus, on a
 //  hardware appliance, the processor error log — with live search, level
 //  filtering, light/dark themes and text export.
 // -----------------------------------------------------------------------------
@@ -32,7 +32,7 @@ using StreamWriter = Crestron.SimplSharp.CrestronIO.StreamWriter;
 namespace CwsDebug
 {
     /// <summary>
-    /// Self-contained debug log page served via Crestron Web Server (CWS).
+    /// Self-contained debug log page served via Crestron Web Scripting (CWS).
     ///
     /// Exposed as a process-wide singleton: the whole public API is static, so any class
     /// in the program can log to it without being handed an instance and without the
@@ -216,7 +216,7 @@ namespace CwsDebug
         private const string Version = "1.7.0";
 
         /// <summary>
-        /// Starts the CWS web server. Call from InitializeSystem(), not the constructor.
+        /// Starts serving the page through CWS. Call from InitializeSystem(), not the constructor.
         /// The header shows "{Name} - Debugger", where Name is the room name on VC-4 and the
         /// host program's namespace/assembly name on an appliance, falling back to the
         /// controller's prompt name, then the base-path segment, then "Debugger".
